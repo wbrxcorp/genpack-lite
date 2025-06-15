@@ -282,6 +282,42 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
             tee.stdin.close()
             tee.wait()
 
+def set_gentoo_profile(lower_image, profile_name):
+    with TempMount(lower_image) as mount_point:
+        portage_dir = os.path.join(mount_point, "var/db/repos/gentoo")
+        profiles_default_linux_dir = os.path.join(portage_dir, "profiles/default/linux")
+        if not os.path.isdir(profiles_default_linux_dir):
+            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux directory.")
+        arch_map = {
+            "loongarch64": "loong",
+            "ppc": "powerpc",
+            "riscv64": "riscv",
+            "riscv32": "riscv",
+            "i686": "x86",
+            "x86_64": "amd64",
+            "aarch64": "arm64",
+        }
+        portage_arch = arch_map.get(arch, arch)
+        arch_dir = os.path.join(profiles_default_linux_dir, portage_arch)
+        if not os.path.isdir(arch_dir):
+            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux/{portage_arch} directory.")
+        # enum subdirectories in arch_dir
+        subdirs = [float(d) for d in os.listdir(arch_dir) if os.path.isdir(os.path.join(arch_dir, d))]
+        if len(subdirs) == 0:
+            raise Exception(f"Portage directory {portage_dir} does not contain any subdirectories in profiles/default/linux/{portage_arch} directory.")
+        #else
+        #pick the latest subdirectory
+        latest_subdir = max(subdirs)
+        latest_profile_dir = os.path.join(arch_dir, str(latest_subdir))
+        exact_profile_dir = os.path.join(latest_profile_dir, profile_name)
+        if not os.path.isdir(exact_profile_dir):
+            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux/{portage_arch}/{latest_subdir}/{profile_name} directory.")
+        #else
+        exact_profile = os.path.join(f"default/linux/{portage_arch}/{latest_subdir}", profile_name)
+        logging.info(f"Setting Gentoo profile to {exact_profile} in {mount_point}")
+        subprocess.run(sudo(['chroot', mount_point, "eselect", "profile", "set", exact_profile]), check=True)
+        logging.info(f"Gentoo profile set to {exact_profile} successfully.")
+
 def lower(bash=False):
     logging.info("Starting genpack setup...")
     os.makedirs(work_dir, exist_ok=True)
@@ -320,6 +356,10 @@ def lower(bash=False):
     if portage_is_new:
         with open(portage_saved_headers_path, 'w') as f:
             f.write(headers_to_info(portage_headers))
+    
+    gentoo_profile = genpack_json.get("gentoo-profile", None)
+    if gentoo_profile is not None and stage3_is_new:
+        set_gentoo_profile(lower_image, gentoo_profile)
     
     sync_genpack_overlay(lower_image)
 
