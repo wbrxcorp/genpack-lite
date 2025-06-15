@@ -12,6 +12,7 @@ upper_dir = os.path.join(work_dir, "upper")
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
 overlay_source = "https://github.com/wbrxcorp/genpack-overlay.git"
+genpack_json = None
 
 def sudo(cmd):
     # if current user is root, just return the command
@@ -281,14 +282,6 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
             tee.stdin.close()
             tee.wait()
 
-def load_genpack_json():
-    """Load genpack.json file."""
-    if os.path.isfile("genpack.json"):
-        with open("genpack.json", "r") as f:
-            return json.load(f)
-    else:
-        raise FileNotFoundError("genpack.json file not found. Please create it in the current directory.")
-
 def lower(bash=False):
     logging.info("Starting genpack setup...")
     os.makedirs(work_dir, exist_ok=True)
@@ -330,9 +323,15 @@ def lower(bash=False):
     
     sync_genpack_overlay(lower_image)
 
-    genpack_json = load_genpack_json()
-    accept_keywords = {"dev-cpp/argparse":None} | genpack_json.get("accept_keywords", {})
-    use = {"sys-kernel/installkernel":"dracut"} | genpack_json.get("use", {})
+    accept_keywords = {
+        "dev-cpp/argparse":None # argparse is required for genpack-progs
+    } | genpack_json.get("accept_keywords", {})
+    use = {
+        "sys-libs/glibc": "audit", # Intentionally causing glibc to be rebuilt
+        "sys-kernel/installkernel":"dracut", # genpack depends on dracut
+        "dev-lang/perl":"minimal",
+        "app-editors/vim":"minimal"
+    } | genpack_json.get("use", {})
     license = genpack_json.get("license", {})
     mask = genpack_json.get("mask", [])
     apply_portage_flags(lower_image, accept_keywords, use, license, mask)
@@ -358,8 +357,7 @@ def lower(bash=False):
     lower_exec(lower_image, ["eclean-dist", "-d"])
     lower_exec(lower_image, ["eclean-pkg", "-d"])
 
-def upper():
-    genpack_json = load_genpack_json()
+def upper(bash=False):
     packages = genpack_json.get("packages", [])
     if len(packages) == 0:
         logging.info("No packages specified in genpack.json.")
@@ -377,10 +375,6 @@ def upper():
     cmdline += packages
 
     upper_exec(lower_image, upper_dir, cmdline)
-
-    # copy files
-    logging.info("Copying files from 'files' directory to upper directory.")
-    subprocess.run(sudo(['cp', '-rdv', 'files/.', upper_dir]), check=True)
 
     # create groups
     groups = genpack_json.get("groups", [])
@@ -439,6 +433,13 @@ def upper():
         logging.info("Creating user %s..." % name)
         upper_exec(lower_image, upper_dir, useradd_cmd)
 
+    # copy files
+    if os.path.isdir("files"):
+        logging.info("Copying files from 'files' directory to upper directory.")
+        subprocess.run(sudo(['cp', '-rdv', 'files/.', upper_dir]), check=True)
+    else:
+        logging.info("No 'files' directory found, skipping file copy.")
+
     # execute build sctript if exists
     build_script = os.path.join(upper_dir, "build")
     if os.path.isfile(build_script):
@@ -448,10 +449,17 @@ def upper():
         subprocess.run(sudo(['rm', '-f', build_script]), check=True)
     else:
         logging.info("No build script found.")
+    
+    if bash:
+        logging.info("Running bash in the upper directory for debugging.")
+        upper_exec(lower_image, upper_dir, "bash")
+        return
 
+    # else
     # enable services
     services = genpack_json.get("services", [])
-    upper_exec(lower_image, upper_dir, ["systemctl", "enable"] + services)
+    if len(services) > 0:
+        upper_exec(lower_image, upper_dir, ["systemctl", "enable"] + services)
 
     name = genpack_json.get("name", "genpack")
     outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
@@ -469,9 +477,15 @@ def upper():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("action", choices=["build", "lower", "bash", "upper"], nargs="?", default="build", help="Action to perform")
+    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+
+    if not os.path.isfile("genpack.json"):
+        raise FileNotFoundError("genpack.json file not found. Please create it in the current directory.")
+    #else
+    with open("genpack.json", "r") as f:
+        genpack_json = json.load(f)
 
     if not os.path.isfile(".gitignore"):
         with open(".gitignore", "w") as f:
@@ -493,5 +507,5 @@ if __name__ == "__main__":
 
     if args.action in ["build", "lower", "bash"]:
         lower(args.action == "bash")
-    if args.action in ["build", "upper"]:
-        upper()
+    if args.action in ["build", "upper", "upper-bash"]:
+        upper(args.action == "upper-bash")
