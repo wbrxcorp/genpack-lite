@@ -1,0 +1,2 @@
+# genpack-lite
+Simplified genpack
