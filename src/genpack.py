@@ -89,24 +89,24 @@ def download(url, dest):
 class TempMount:
     def __init__(self, image_path):
         self.image_path = image_path
-        logging.info(f"Initializing TempMount with image: {self.image_path}")
+        logging.debug(f"Initializing TempMount with image: {self.image_path}")
         self.mount_point = tempfile.mkdtemp(prefix="genpack_mount_")
-        logging.info(f"Temporary mount point created: {self.mount_point}")
+        logging.debug(f"Temporary mount point created: {self.mount_point}")
 
     def __enter__(self):
         # Logic to mount the filesystem
-        logging.info(f"Mounting to {self.mount_point}")
+        logging.debug(f"Mounting to {self.mount_point}")
         subprocess.run(sudo(['mount', self.image_path, self.mount_point]), check=True)
-        logging.info(f"Mounted {self.image_path} at {self.mount_point}")
+        logging.debug(f"Mounted {self.image_path} at {self.mount_point}")
         return self.mount_point
 
     def __exit__(self, exc_type, exc_value, traceback):
         # Logic to unmount the filesystem
-        logging.info(f"Unmounting {self.mount_point}")
+        logging.debug(f"Unmounting {self.mount_point}")
         subprocess.run(sudo(['umount', self.mount_point]), check=True)
         # Clean up the temporary mount point
         os.rmdir(self.mount_point)
-        logging.info(f"Temporary mount point removed: {self.mount_point}")
+        logging.debug(f"Temporary mount point removed: {self.mount_point}")
 
 def create_sparse_file(file_path, size_in_mib):
     """Create a sparse file of the specified size."""
@@ -149,7 +149,7 @@ def replace_portage(lower_image, portage_tarball):
             old_portage_dir = portage_dir + ".old-" + datetime.now().strftime("%Y%m%d-%H%M%S")
             logging.info(f"Renaming old portage directory to {old_portage_dir}")
             subprocess.run(sudo(['mv', portage_dir, old_portage_dir]), check=True)
-
+        subprocess.run(sudo(["mkdir", "-p", portage_dir]), check=True)
         subprocess.run(sudo(['tar', 'xvpf', portage_tarball, '-C', portage_dir, "--strip-components=1"]), check=True)
         logging.info("Portage replaced successfully.")
 
@@ -226,7 +226,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         accept_keywords_file = os.path.join(mount_point, "etc/portage/package.accept_keywords/genpack")
         logging.info(f"Applying accept keywords to {accept_keywords_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(accept_keywords_file)]), check=True)
-        tee = subprocess.Popen(sudo(['tee', accept_keywords_file]), stdin=subprocess.PIPE, text=True)
+        tee = subprocess.Popen(sudo(['tee', accept_keywords_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         try:
             for k, v in accept_keywords.items():
                 if v is None:
@@ -242,7 +242,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         use_file = os.path.join(mount_point, "etc/portage/package.use/genpack")
         logging.info(f"Applying USE flags to {use_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(use_file)]), check=True)
-        tee = subprocess.Popen(sudo(['tee', use_file]), stdin=subprocess.PIPE, text=True)
+        tee = subprocess.Popen(sudo(['tee', use_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         try:
             for k, v in use.items():
                 if v is None:
@@ -258,7 +258,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         license_file = os.path.join(mount_point, "etc/portage/package.license/genpack")
         logging.info(f"Applying LICENSE flags to {license_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(license_file)]), check=True)
-        tee = subprocess.Popen(sudo(['tee', license_file]), stdin=subprocess.PIPE, text=True)
+        tee = subprocess.Popen(sudo(['tee', license_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         try:
             for k, v in license.items():
                 if v is None:
@@ -274,7 +274,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         mask_file = os.path.join(mount_point, "etc/portage/package.mask/genpack")
         logging.info(f"Applying masked packages to {mask_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(mask_file)]), check=True)
-        tee = subprocess.Popen(sudo(['tee', mask_file]), stdin=subprocess.PIPE, text=True)
+        tee = subprocess.Popen(sudo(['tee', mask_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         try:
             for pkg in mask:
                 tee.stdin.write(f"{pkg}\n")
