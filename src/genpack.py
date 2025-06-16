@@ -8,6 +8,9 @@ arch = os.uname().machine
 work_root = "work"
 work_dir = os.path.join(work_root, arch)
 lower_image = os.path.join(work_dir, "lower.img")
+lower_initial_allocation_size_in_gib = 2  # Initial allocation size for lower image in GiB
+# stage3's expanded size is about 1.2GiB(in x86_64), so we allocate 2GiB for initial allocation
+lower_total_size_in_gib = 16  # Total size for lower image in GiB
 upper_dir = os.path.join(work_dir, "upper")
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
@@ -108,33 +111,35 @@ class TempMount:
         os.rmdir(self.mount_point)
         logging.debug(f"Temporary mount point removed: {self.mount_point}")
 
-def create_sparse_file(file_path, size_in_mib):
-    """Create a sparse file of the specified size."""
-    logging.info(f"Creating sparse file at {file_path} with size {size_in_mib} MiB")
-    with open(file_path, 'wb') as f:
-        f.seek(size_in_mib * 1024 * 1024 - 1)
-        f.write(b'\0')
-    logging.info(f"Sparse file created: {file_path}")
-
-def format_filesystem(file_path):
-    logging.info(f"Formatting filesystem on {file_path}")
-    subprocess.run(['mkfs.xfs', file_path], check=True)
-
 def setup_lower_image(lower_image, stage3_tarball, portage_tarball):
-    create_sparse_file(lower_image, 16384)  # Create a 16 GiB sparse file
+    # create image file
+    if lower_initial_allocation_size_in_gib > lower_total_size_in_gib:
+        raise ValueError("Initial allocation size must be less than or equal to total size.")
+    logging.info(f"Creating image file at {lower_image} with size {lower_total_size_in_gib} GiB")
+    with open(lower_image, "wb") as f:
+        fd = f.fileno()
+        os.posix_fallocate(fd, 0, lower_initial_allocation_size_in_gib * 1024 * 1024 * 1024)
     try:
-        format_filesystem(lower_image)
-        logging.info(f"Lower image created and formatted: {lower_image}")
+        logging.info(f"Formatting filesystem on {lower_image}")
+        subprocess.run(['mkfs.xfs', lower_image], check=True)
+        logging.info("Filesystem formatted successfully.")
+        with TempMount(lower_image) as mount_point:
+            logging.info("Extracting stage3 to lower image...")
+            subprocess.run(sudo(['tar', 'xpf', stage3_tarball, '-C', mount_point]), check=True)
+
+        with open(lower_image, "r+b") as f:
+            # seek to the total size and write a null byte to expand the filesystem
+            f.seek(lower_total_size_in_gib * 1024 * 1024 * 1024 - 1)
+            f.write(b'\x00')
 
         with TempMount(lower_image) as mount_point:
-            logging.info(f"Using temporary mount point: {mount_point}")
-            # Here you would perform operations on the mounted filesystem
-            # For example, copying files, etc.
-            logging.info("Performing operations on the mounted filesystem...")
-            subprocess.run(sudo(['tar', 'xvpf', stage3_tarball, '-C', mount_point]), check=True)
+            # expand the filesystem after extracting
+            logging.info("Expanding filesystem to total size...")
+            subprocess.run(sudo(['xfs_growfs', mount_point]), check=True)
+            logging.info("Extracting portage to lower image...")
             portage_dir = os.path.join(mount_point, "var/db/repos/gentoo")
             subprocess.run(sudo(["mkdir", "-p", portage_dir]), check=True)
-            subprocess.run(sudo(['tar', 'xvpf', portage_tarball, '-C', portage_dir, "--strip-components=1"]), check=True)
+            subprocess.run(sudo(['tar', 'xpf', portage_tarball, '-C', portage_dir, "--strip-components=1"]), check=True)
     except Exception as e:
         logging.error(f"Error setting up lower image: {e}")
         os.remove(lower_image)  # Clean up the image
@@ -150,10 +155,10 @@ def replace_portage(lower_image, portage_tarball):
             logging.info(f"Renaming old portage directory to {old_portage_dir}")
             subprocess.run(sudo(['mv', portage_dir, old_portage_dir]), check=True)
         subprocess.run(sudo(["mkdir", "-p", portage_dir]), check=True)
-        subprocess.run(sudo(['tar', 'xvpf', portage_tarball, '-C', portage_dir, "--strip-components=1"]), check=True)
+        subprocess.run(sudo(['tar', 'xpf', portage_tarball, '-C', portage_dir, "--strip-components=1"]), check=True)
         logging.info("Portage replaced successfully.")
 
-def lower_exec(lower_image, cmdline):
+def lower_exec(lower_image, cmdline, env=None):
     if isinstance(cmdline, str):
         cmdline = [cmdline]
     # use PID for container name
@@ -165,6 +170,12 @@ def lower_exec(lower_image, cmdline):
         "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN",
     ]
+    if env is not None:
+        if not isinstance(env, dict):
+            raise ValueError("env must be a dictionary")
+        #else
+        for k, v in env.items():
+            nspawn_cmdline.append(f"--setenv={k}={v}")
     nspawn_cmdline += cmdline
 
     subprocess.run(sudo(nspawn_cmdline), check=True)
@@ -318,8 +329,8 @@ def set_gentoo_profile(lower_image, profile_name):
         subprocess.run(sudo(['chroot', mount_point, "eselect", "profile", "set", exact_profile]), check=True)
         logging.info(f"Gentoo profile set to {exact_profile} successfully.")
 
-def lower(bash=False):
-    logging.info("Starting genpack setup...")
+def lower():
+    logging.info("Processing lower layer...")
     os.makedirs(work_dir, exist_ok=True)
     # todo: create .gitignore in work_root
     stage3_is_new = False
@@ -363,6 +374,8 @@ def lower(bash=False):
     
     sync_genpack_overlay(lower_image)
 
+    # TODO: read /var/db/repos/genpack-overlay/*/*/genpack-hints.json
+
     accept_keywords = {
         "dev-cpp/argparse":None # argparse is required for genpack-progs
     } | genpack_json.get("accept_keywords", {})
@@ -376,15 +389,19 @@ def lower(bash=False):
     mask = genpack_json.get("mask", [])
     apply_portage_flags(lower_image, accept_keywords, use, license, mask)
 
-    if bash:
-        logging.info("Running bash in the lower image for debugging.")
-        lower_exec(lower_image, "bash")
-        return
+    # circurlar dependency breaker
+    if "circulardep-breaker" in genpack_json:
+        circulardep_breaker_packages = genpack_json["circulardep-breaker"].get("packages", [])
+        circulardep_breaker_use = genpack_json["circulardep-breaker"].get("use", None)
+        if len(circulardep_breaker_packages) > 0:
+            logging.info("Emerging circular dependency breaker packages")
+            env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
+            lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-u"] + circulardep_breaker_packages, env)
 
-    #else
     lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "genpack-progs", "--keep-going"])
 
     lower_exec(lower_image, ["emaint", "binhost", "--fix"])
+
     packages = genpack_json.get("packages", [])
     if len(packages) > 0:
         lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going", "world"] + packages)
@@ -397,7 +414,15 @@ def lower(bash=False):
     lower_exec(lower_image, ["eclean-dist", "-d"])
     lower_exec(lower_image, ["eclean-pkg", "-d"])
 
-def upper(bash=False):
+    with open(os.path.join(work_dir, "lower.done"), "w") as f:
+        pass
+
+def bash():
+    logging.info("Running bash in the lower image for debugging.")
+    lower_exec(lower_image, "bash")
+
+def upper():
+    logging.info("Processing upper layer...")
     packages = genpack_json.get("packages", [])
     if len(packages) == 0:
         logging.info("No packages specified in genpack.json.")
@@ -485,17 +510,18 @@ def upper(bash=False):
     if os.path.isfile(build_script):
         logging.info(f"Executing build script: /build")
         upper_exec(lower_image, upper_dir, ["/build"])
-        # remove build script after execution
-        subprocess.run(sudo(['rm', '-f', build_script]), check=True)
-    else:
-        logging.info("No build script found.")
+    build_script_d = os.path.join(upper_dir, "build.d")
+    if os.path.isdir(build_script_d):
+        # os.listdir returns filenames in arbitrary order, usually ASCII order on most filesystems,
+        # but it is not guaranteed by Python. If you want ASCII order, sort explicitly:
+        for script in sorted(os.listdir(build_script_d)):
+            script_path = os.path.join(build_script_d, script)
+            if os.path.isfile(script_path) and os.access(script_path, os.X_OK):
+                logging.info(f"Executing build script: /build.d/{script}")
+                upper_exec(lower_image, upper_dir, ["/build.d/" + script])
+            else:
+                logging.warning(f"Skipping non-executable file: /build.d/{script}")
     
-    if bash:
-        logging.info("Running bash in the upper directory for debugging.")
-        upper_exec(lower_image, upper_dir, "bash")
-        return
-
-    # else
     # enable services
     services = genpack_json.get("services", [])
     if len(services) > 0:
@@ -504,15 +530,22 @@ def upper(bash=False):
     name = genpack_json.get("name", "genpack")
     outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
     compression = genpack_json.get("compression", "gzip")
-    cmdline = ["mksquashfs", upper_dir, outfile, "-noappend", "-no-exports"]
+    cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-e", "build", "build.d", "build.d/*", "-noappend", "-no-exports"]
     if compression == "xz": cmdline += ["-comp", "xz", "-b", "1M"]
     elif compression == "gzip": cmdline += ["-Xcompression-level", "1"]
     elif compression == "lzo": cmdline += ["-comp", "lzo"]
     elif compression == "none": cmdline += ["-no-compression"]
     else:
         raise ValueError(f"Unknown compression type: {compression}")
+    if os.path.exists(outfile):
+        logging.info(f"Output file {outfile} already exists, removing it.")
+        os.remove(outfile)
     subprocess.run(sudo(cmdline), check=True)
     subprocess.check_call(sudo(["chown", "%d:%d" % (os.getuid(), os.getgid()), outfile]))
+
+def upper_bash():
+    logging.info("Running bash in the upper directory for debugging.")
+    upper_exec(lower_image, upper_dir, "bash")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
@@ -545,7 +578,14 @@ if __name__ == "__main__":
                 f.write('}\n')
             logging.info("Created .vscode/settings.json with default settings.")
 
-    if args.action in ["build", "lower", "bash"]:
-        lower(args.action == "bash")
-    if args.action in ["build", "upper", "upper-bash"]:
-        upper(args.action == "upper-bash")
+    if args.action == "bash":
+        bash()
+        exit(0)
+    elif args.action == "upper-bash":
+        upper_bash()
+        exit(0)
+    #else
+    if args.action in ["build", "lower"]:
+        lower()
+    if args.action in ["build", "upper"]:
+        upper()
