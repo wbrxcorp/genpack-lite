@@ -1,16 +1,18 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-import os,logging,tempfile,subprocess,re,json,argparse
+import os,logging,tempfile,subprocess,re,json,argparse,json
 from datetime import datetime
-import requests
+
+import json5 # dev-python/json5
+import requests # dev-python/requests
+
+DEFAULT_LOWER_INITIAL_ALLOCATION_SIZE_IN_GIB = 2  # Default initial allocation size for lower image in GiB
+DEFAULT_LOWER_TOTAL_SIZE_IN_GIB = 20  # Default total size for lower image in GiB
 
 arch = os.uname().machine
 work_root = "work"
 work_dir = os.path.join(work_root, arch)
 lower_image = os.path.join(work_dir, "lower.img")
-lower_initial_allocation_size_in_gib = 2  # Initial allocation size for lower image in GiB
-# stage3's expanded size is about 1.2GiB(in x86_64), so we allocate 2GiB for initial allocation
-lower_total_size_in_gib = 16  # Total size for lower image in GiB
 upper_dir = os.path.join(work_dir, "upper")
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
@@ -113,9 +115,11 @@ class TempMount:
 
 def setup_lower_image(lower_image, stage3_tarball, portage_tarball):
     # create image file
+    lower_initial_allocation_size_in_gib = genpack_json.get("minimum-lower-layer-capacity", DEFAULT_LOWER_INITIAL_ALLOCATION_SIZE_IN_GIB)
+    lower_total_size_in_gib = max(lower_initial_allocation_size_in_gib * 2, DEFAULT_LOWER_TOTAL_SIZE_IN_GIB)
     if lower_initial_allocation_size_in_gib > lower_total_size_in_gib:
         raise ValueError("Initial allocation size must be less than or equal to total size.")
-    logging.info(f"Creating image file at {lower_image} with size {lower_total_size_in_gib} GiB")
+    logging.info(f"Creating image file at {lower_image} with size {lower_initial_allocation_size_in_gib} GiB (initial) and {lower_total_size_in_gib} GiB (total).")
     with open(lower_image, "wb") as f:
         fd = f.fileno()
         os.posix_fallocate(fd, 0, lower_initial_allocation_size_in_gib * 1024 * 1024 * 1024)
@@ -166,7 +170,7 @@ def lower_exec(lower_image, cmdline, env=None):
     cache_dir = os.path.join(work_dir, "cache")
     os.makedirs(cache_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
-        "-M", container_name, f"--image={lower_image}",
+        "--as-pid2", "-M", container_name, f"--image={lower_image}",
         "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN",
     ]
@@ -189,7 +193,8 @@ def upper_exec(lower_image, upper_dir, cmdline):
     if isinstance(cmdline, str): cmdline = [cmdline]
     container_name = "genpack-%d" % os.getpid()
     cache_dir = os.path.join(work_dir, "cache")
-    subprocess.check_call(sudo(["systemd-nspawn", "-q", "--suppress-sync=true", "-M", container_name, 
+    subprocess.check_call(sudo(["systemd-nspawn", "-q", "--suppress-sync=true", 
+        "--as-pid2", "-M", container_name, 
         f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
         "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
         "--capability=CAP_MKNOD"]
@@ -292,6 +297,8 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         finally:
             tee.stdin.close()
             tee.wait()
+        
+        #TODO: patches, savedconfig
 
 def set_gentoo_profile(lower_image, profile_name):
     with TempMount(lower_image) as mount_point:
@@ -357,8 +364,10 @@ def lower():
         portage_headers = download(portage_url, portage_tarball)
         portage_is_new = True
 
+    image_is_new = False
     if stage3_is_new or not os.path.isfile(lower_image):
         setup_lower_image(lower_image, stage3_tarball, portage_tarball)
+        image_is_new = True
         with open(stage3_saved_headers_path, 'w') as f:
             f.write(headers_to_info(stage3_headers))
     elif portage_is_new:
@@ -369,7 +378,7 @@ def lower():
             f.write(headers_to_info(portage_headers))
     
     gentoo_profile = genpack_json.get("gentoo-profile", None)
-    if gentoo_profile is not None and stage3_is_new:
+    if gentoo_profile is not None and image_is_new:
         set_gentoo_profile(lower_image, gentoo_profile)
     
     sync_genpack_overlay(lower_image)
@@ -403,10 +412,9 @@ def lower():
     lower_exec(lower_image, ["emaint", "binhost", "--fix"])
 
     packages = genpack_json.get("packages", [])
+    packages += genpack_json.get("buildtime-packages", [])
     if len(packages) > 0:
         lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going", "world"] + packages)
-
-    #lower_exec(lower_image, "bash")
 
     lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "@preserved-rebuild"])
     lower_exec(lower_image, ["emerge", "--depclean"])
@@ -414,8 +422,8 @@ def lower():
     lower_exec(lower_image, ["eclean-dist", "-d"])
     lower_exec(lower_image, ["eclean-pkg", "-d"])
 
-    with open(os.path.join(work_dir, "lower.done"), "w") as f:
-        pass
+    #with open(os.path.join(work_dir, "lower.done"), "w") as f:
+    #    pass
 
 def bash():
     logging.info("Running bash in the lower image for debugging.")
@@ -527,38 +535,55 @@ def upper():
     if len(services) > 0:
         upper_exec(lower_image, upper_dir, ["systemctl", "enable"] + services)
 
+def upper_bash():
+    if not os.path.isdir(upper_dir):
+        raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
+    logging.info("Running bash in the upper directory for debugging.")
+    upper_exec(lower_image, upper_dir, "bash")
+
+def pack():
+    if not os.path.isdir(upper_dir):
+        raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
     name = genpack_json.get("name", "genpack")
     outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
     compression = genpack_json.get("compression", "gzip")
-    cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-e", "build", "build.d", "build.d/*", "-noappend", "-no-exports"]
+    cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
     if compression == "xz": cmdline += ["-comp", "xz", "-b", "1M"]
     elif compression == "gzip": cmdline += ["-Xcompression-level", "1"]
     elif compression == "lzo": cmdline += ["-comp", "lzo"]
     elif compression == "none": cmdline += ["-no-compression"]
     else:
         raise ValueError(f"Unknown compression type: {compression}")
+    cmdline += ["-e", "build", "build.d", "build.d/*"]
+    logging.info(f"Creating SquashFS image: {outfile} with compression {compression}")
     if os.path.exists(outfile):
         logging.info(f"Output file {outfile} already exists, removing it.")
         os.remove(outfile)
     subprocess.run(sudo(cmdline), check=True)
     subprocess.check_call(sudo(["chown", "%d:%d" % (os.getuid(), os.getgid()), outfile]))
 
-def upper_bash():
-    logging.info("Running bash in the upper directory for debugging.")
-    upper_exec(lower_image, upper_dir, "bash")
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash"], nargs="?", default="build", help="Action to perform")
+    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "pack"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
-    if not os.path.isfile("genpack.json"):
-        raise FileNotFoundError("genpack.json file not found. Please create it in the current directory.")
+    json_parser, json_file = None, None
+    if os.path.isfile("genpack.json5"):
+        json_parser = json5
+        json_file = "genpack.json5"
+    if os.path.isfile("genpack.json"):
+        if json_parser is None:
+            json_parser = json
+            json_file = "genpack.json"
+        else:
+            raise ValueError("Both genpack.json5 and genpack.json files found. Please remove one of them.")
+    if json_file is None:
+        raise FileNotFoundError("Neither genpack.json5 nor genpack.json file found. Please create one of them.")
     #else
-    with open("genpack.json", "r") as f:
-        genpack_json = json.load(f)
+    with open(json_file, "r") as f:
+        genpack_json = json_parser.load(f)
 
     if not os.path.isfile(".gitignore"):
         with open(".gitignore", "w") as f:
@@ -589,3 +614,5 @@ if __name__ == "__main__":
         lower()
     if args.action in ["build", "upper"]:
         upper()
+    if args.action in ["build", "pack"]:
+        pack()
