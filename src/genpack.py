@@ -197,7 +197,8 @@ def upper_exec(lower_image, upper_dir, cmdline):
         "--as-pid2", "-M", container_name, 
         f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
         "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
-        "--capability=CAP_MKNOD"]
+        "--capability=CAP_MKNOD",
+        "-E", f"ARTIFACT={genpack_json["name"]}"]
         + cmdline))
 
 def sync_genpack_overlay(lower_image):
@@ -544,7 +545,7 @@ def upper_bash():
 def pack():
     if not os.path.isdir(upper_dir):
         raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
-    name = genpack_json.get("name", "genpack")
+    name = genpack_json["name"]
     outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
     compression = genpack_json.get("compression", "gzip")
     cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
@@ -584,6 +585,9 @@ if __name__ == "__main__":
     #else
     with open(json_file, "r") as f:
         genpack_json = json_parser.load(f)
+    if "name" not in genpack_json:
+        genpack_json["name"] = os.path.basename(os.path.dirname(os.path.abspath(genpack_json)))
+        logging.warning(f"'name' not found in {json_file}, using default: {genpack_json['name']}")  
 
     if not os.path.isfile(".gitignore"):
         with open(".gitignore", "w") as f:
