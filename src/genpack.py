@@ -8,6 +8,7 @@ import requests # dev-python/requests
 
 DEFAULT_LOWER_INITIAL_ALLOCATION_SIZE_IN_GIB = 2  # Default initial allocation size for lower image in GiB
 DEFAULT_LOWER_TOTAL_SIZE_IN_GIB = 20  # Default total size for lower image in GiB
+OVERLAY_SOURCE = "https://github.com/wbrxcorp/genpack-overlay.git"
 
 arch = os.uname().machine
 work_root = "work"
@@ -16,7 +17,7 @@ lower_image = os.path.join(work_dir, "lower.img")
 upper_dir = os.path.join(work_dir, "upper")
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
-overlay_source = "https://github.com/wbrxcorp/genpack-overlay.git"
+overlay_override = None
 genpack_json = None
 
 def sudo(cmd):
@@ -171,9 +172,14 @@ def lower_exec(lower_image, cmdline, env=None):
     os.makedirs(cache_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, f"--image={lower_image}",
-        "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN",
+        "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
     ]
+    if overlay_override is not None:
+        if not os.path.isdir(overlay_override):
+            raise ValueError("overlay-override must be a directory")
+        #else
+        nspawn_cmdline.append(f"--bind={os.path.abspath(overlay_override)}:/var/db/repos/genpack-overlay")
     if env is not None:
         if not isinstance(env, dict):
             raise ValueError("env must be a dictionary")
@@ -208,7 +214,7 @@ def sync_genpack_overlay(lower_image):
             subprocess.run(sudo(['git', '-C', genpack_overlay_dir, 'pull']), check=True)
         else:
             logging.info("Genpack overlay not found, cloning...")
-            subprocess.run(sudo(['git', 'clone', overlay_source, genpack_overlay_dir]), check=True)
+            subprocess.run(sudo(['git', 'clone', OVERLAY_SOURCE, genpack_overlay_dir]), check=True)
         repos_conf = os.path.join(mount_point, "etc/portage/repos.conf/genpack-overlay.conf")
         if not os.path.isfile(repos_conf):
             logging.info("Creating repos.conf for genpack-overlay")
@@ -574,6 +580,7 @@ def pack():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--overlay-override", default=None, help="Directory to override genpack-overlay")
     parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "pack"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
@@ -614,6 +621,8 @@ if __name__ == "__main__":
                 f.write('  "python.analysis.exclude": ["work/"]\n')
                 f.write('}\n')
             logging.info("Created .vscode/settings.json with default settings.")
+    
+    overlay_override = args.overlay_override
 
     if args.action == "bash":
         bash()
