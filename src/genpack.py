@@ -308,31 +308,35 @@ def set_gentoo_profile(lower_image, profile_name):
         if not os.path.isdir(profiles_default_linux_dir):
             raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux directory.")
         arch_map = {
-            "loongarch64": "loong",
-            "ppc": "powerpc",
-            "riscv64": "riscv",
-            "riscv32": "riscv",
-            "i686": "x86",
-            "x86_64": "amd64",
-            "aarch64": "arm64",
+            "alpha": ("alpha",),
+            "x86_64": ("amd64",),
+            "aarch64": ("arm64",),
+            "ppc": ("ppc",),
+            "ppc64": ("ppc64",),
+            "ppc64le": ("pc64le",),
+            "i686": ("x86","i686"),
+            "riscv64": ("riscv","rv64/lp64d"),
+            "loong": ("loong", "la64v100/lp64d"),
         }
-        portage_arch = arch_map.get(arch, arch)
-        arch_dir = os.path.join(profiles_default_linux_dir, portage_arch)
+        portage_arch = arch_map.get(arch, None)
+        if portage_arch is None:
+            raise Exception(f"Unsupported architecture: {arch}. Please add it to arch_map in {__file__}.")
+        arch_dir = os.path.join(profiles_default_linux_dir, portage_arch[0])
         if not os.path.isdir(arch_dir):
-            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux/{portage_arch} directory.")
+            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux/{portage_arch[0]} directory.")
         # enum subdirectories in arch_dir
         subdirs = [float(d) for d in os.listdir(arch_dir) if os.path.isdir(os.path.join(arch_dir, d))]
         if len(subdirs) == 0:
-            raise Exception(f"Portage directory {portage_dir} does not contain any subdirectories in profiles/default/linux/{portage_arch} directory.")
+            raise Exception(f"Portage directory {portage_dir} does not contain any subdirectories in profiles/default/linux/{portage_arch[0]} directory.")
         #else
         #pick the latest subdirectory
         latest_subdir = max(subdirs)
         latest_profile_dir = os.path.join(arch_dir, str(latest_subdir))
-        exact_profile_dir = os.path.join(latest_profile_dir, profile_name)
+        exact_profile_dir = os.path.join(latest_profile_dir, portage_arch[1] if len(portage_arch) > 1 else "", profile_name)
         if not os.path.isdir(exact_profile_dir):
-            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux/{portage_arch}/{latest_subdir}/{profile_name} directory.")
+            raise Exception(f"Portage directory {portage_dir} does not contain profiles/default/linux/{portage_arch[0]}/{latest_subdir}/{profile_name} directory.")
         #else
-        exact_profile = os.path.join(f"default/linux/{portage_arch}/{latest_subdir}", profile_name)
+        exact_profile = os.path.join(f"default/linux/{portage_arch[0]}/{latest_subdir}", portage_arch[1] if len(portage_arch) > 1 else "", profile_name)
         logging.info(f"Setting Gentoo profile to {exact_profile} in {mount_point}")
         subprocess.run(sudo(['chroot', mount_point, "eselect", "profile", "set", exact_profile]), check=True)
         logging.info(f"Gentoo profile set to {exact_profile} successfully.")
@@ -404,24 +408,28 @@ def lower():
         circulardep_breaker_packages = genpack_json["circulardep-breaker"].get("packages", [])
         circulardep_breaker_use = genpack_json["circulardep-breaker"].get("use", None)
         if len(circulardep_breaker_packages) > 0:
-            logging.info("Emerging circular dependency breaker packages")
+            logging.info("Emerging circular dependency breaker packages...")
             env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
             lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-u"] + circulardep_breaker_packages, env)
 
-    lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "genpack-progs", "--keep-going"])
+    logging.info("Emerging genpack-progs...")
+    emerge_genpack_progs_cmd = "emerge -bk --binpkg-respect-use=y -uDN genpack-progs --keep-going"
+    emerge_genpack_progs_cmd += " && emaint binhost --fix"
+    lower_exec(lower_image, ["sh", "-c", emerge_genpack_progs_cmd])
 
-    lower_exec(lower_image, ["emaint", "binhost", "--fix"])
-
+    logging.info("Emerging specified packages...")
     packages = genpack_json.get("packages", [])
     packages += genpack_json.get("buildtime-packages", [])
     if len(packages) > 0:
         lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going", "world"] + packages)
 
-    lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "@preserved-rebuild"])
-    lower_exec(lower_image, ["emerge", "--depclean"])
-    lower_exec(lower_image, ["etc-update", "--automode", "-5"])
-    lower_exec(lower_image, ["eclean-dist", "-d"])
-    lower_exec(lower_image, ["eclean-pkg", "-d"])
+    logging.info("Cleaning up...")
+    cleanup_cmd = "emerge -bk --binpkg-respect-use=y @preserved-rebuild"
+    cleanup_cmd += " && emerge --depclean"
+    cleanup_cmd += " && etc-update --automode -5"
+    cleanup_cmd += " && eclean-dist -d"
+    cleanup_cmd += " && eclean-pkg -d"
+    lower_exec(lower_image, ["sh", "-c", cleanup_cmd])
 
     #with open(os.path.join(work_dir, "lower.done"), "w") as f:
     #    pass
@@ -586,7 +594,7 @@ if __name__ == "__main__":
     with open(json_file, "r") as f:
         genpack_json = json_parser.load(f)
     if "name" not in genpack_json:
-        genpack_json["name"] = os.path.basename(os.path.dirname(os.path.abspath(genpack_json)))
+        genpack_json["name"] = os.path.basename(os.path.dirname(os.path.abspath(json_file)))
         logging.warning(f"'name' not found in {json_file}, using default: {genpack_json['name']}")  
 
     if not os.path.isfile(".gitignore"):
