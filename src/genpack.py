@@ -194,18 +194,23 @@ def escape_colon(s):
     # systemd-nspawn's some options need colon to be escaped
     return re.sub(r':', r'\:', s)
 
-def upper_exec(lower_image, upper_dir, cmdline):
+def upper_exec(lower_image, upper_dir, cmdline, user=None):
     # convert command to list if it is string
     if isinstance(cmdline, str): cmdline = [cmdline]
     container_name = "genpack-%d" % os.getpid()
     cache_dir = os.path.join(work_dir, "cache")
-    subprocess.check_call(sudo(["systemd-nspawn", "-q", "--suppress-sync=true", 
+    nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, 
         f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
         "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
         "--capability=CAP_MKNOD",
         "-E", f"ARTIFACT={genpack_json["name"]}"]
-        + cmdline))
+    if user is not None:
+        if not isinstance(user, str):
+            raise ValueError("user must be a string")
+        #else
+        nspawn_cmdline.append(f"--user={user}")
+    subprocess.check_call(sudo(nspawn_cmdline + cmdline))
 
 def sync_genpack_overlay(lower_image):
     with TempMount(lower_image) as mount_point:
@@ -486,28 +491,29 @@ def upper():
     users = genpack_json.get("users", [])
     for user in users:
         name = user if isinstance(user, str) else None
-        uid = None
-        comment = None
-        home = None
-        create_home = True
-        initial_group = None
-        additional_groups = []
-        shell = None
         if name is None:
             if not isinstance(user, dict): raise Exception("user must be string or dict")
             #else
             if "name" not in user: raise Exception("user dict must have 'name' key")
             #else
             name = user["name"]
-        if "uid" in user: uid = user["uid"]
-        if "comment" in user: comment = user["comment"]
-        if "home" in user: home = user["home"]
-        if "initial_group" in user: initial_group = user["initial_group"]
+        uid = user.get("uid", None)
+        comment = user.get("comment", None)
+        home = user.get("home", None)
+        create_home = user.get("create-home", True)
+        shell = user.get("shell", None)
+        if "initial_group" in user:
+            raise Exception("Use 'initial-group' instead of 'initial_group'")
+        initial_group = user.get("initial-group", None)
         if "additional_groups" in user:
-            if not isinstance(user["additional_groups"], list): raise Exception("additional_groups must be list")
-            #else
-            additional_groups = user["additional_groups"]
+            raise Exception("Use 'additional-groups' instead of 'additional_groups'")
+        additional_groups = user.get("additional-groups", [])
+        if isinstance(user["additional-groups"], str):
+            additional_groups = [additional_groups]
+        elif not isinstance(user["additional-groups"], list):
+            raise Exception("additional-groups must be list or string")
         if "shell" in user: shell = user["shell"]
+        empty_password = user.get("empty-password", False)
         useradd_cmd = ["useradd"]
         if uid is not None: useradd_cmd += ["-u", str(uid)]
         if comment is not None: useradd_cmd += ["-c", comment]
@@ -517,6 +523,7 @@ def upper():
             useradd_cmd += ["-G", ",".join(additional_groups)]
         if shell is not None: useradd_cmd += ["-s", shell]
         if create_home: useradd_cmd += ["-m"]
+        if empty_password: useradd_cmd += ["-p", ""]
         useradd_cmd.append(name)
         logging.info("Creating user %s..." % name)
         upper_exec(lower_image, upper_dir, useradd_cmd)
@@ -537,14 +544,39 @@ def upper():
     if os.path.isdir(build_script_d):
         # os.listdir returns filenames in arbitrary order, usually ASCII order on most filesystems,
         # but it is not guaranteed by Python. If you want ASCII order, sort explicitly:
+        user_subdirs = []
+        def determine_interpreter(script):
+            if os.access(script_path, os.X_OK): return None
+            #else
+            if script.endswith(".sh"): return "/bin/sh"
+            #else
+            if script.endswith(".py"): return "/usr/bin/python"
+            raise ValueError(f"Script is not executable: {script}")
+
         for script in sorted(os.listdir(build_script_d)):
             script_path = os.path.join(build_script_d, script)
-            if os.path.isfile(script_path) and os.access(script_path, os.X_OK):
+            if os.path.isfile(script_path):
+                interpreter = determine_interpreter(script_path)
                 logging.info(f"Executing build script: /build.d/{script}")
-                upper_exec(lower_image, upper_dir, ["/build.d/" + script])
-            else:
-                logging.warning(f"Skipping non-executable file: /build.d/{script}")
-    
+                script_to_run_in_container = os.path.join("/build.d", script)
+                upper_exec(lower_image, upper_dir, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container])
+            elif os.path.isdir(script_path):
+                user_subdirs.append(script)
+                logging.info(f"Found user subdirectory in build.d: {script_path}")
+        
+        for subdir in user_subdirs:
+            subdir_path = os.path.join(build_script_d, subdir)
+            for script in sorted(os.listdir(subdir_path)):
+                script_path = os.path.join(subdir_path, script)
+                if not os.path.isfile(script_path):
+                    logging.warning(f"Skipping non-file in /build.d/{subdir}: {script}")
+                    continue
+                #else
+                logging.info(f"Executing build script in user subdirectory: /build.d/{subdir}/{script} as user {subdir}")
+                interpreter = determine_interpreter(script_path)
+                script_to_run_in_container = os.path.join("/build.d", subdir, script)
+                upper_exec(lower_image, upper_dir, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container], user=subdir)
+
     # enable services
     services = genpack_json.get("services", [])
     if len(services) > 0:
