@@ -465,6 +465,8 @@ def upper():
     logging.info("Executing copyup-packages...")
     cmdline = ["/usr/bin/copyup-packages", "--bind-mount-root", "--toplevel-dirs", "--exec-package-scripts"]
     cmdline += ["--generate-metadata"]
+    if genpack_json.get("devel", False):
+        cmdline += ["--devel"]
     cmdline += packages
 
     upper_exec(lower_image, upper_dir, cmdline)
