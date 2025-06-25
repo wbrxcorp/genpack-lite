@@ -18,6 +18,7 @@ upper_dir = os.path.join(work_dir, "upper")
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
 overlay_override = None
+compression = None
 genpack_json = None
 
 def sudo(cmd):
@@ -449,6 +450,16 @@ def bash():
     logging.info("Running bash in the lower image for debugging.")
     lower_exec(lower_image, "bash")
 
+def copy_upper_files():
+    if not os.path.isdir(upper_dir):
+        raise FileNotFoundError(f"Upper directory {upper_dir} does not exist.")
+    # copy files
+    if os.path.isdir("files"):
+        logging.info("Copying files from 'files' directory to upper directory.")
+        subprocess.run(sudo(['cp', '-rdv', 'files/.', upper_dir]), check=True)
+    else:
+        logging.info("No 'files' directory found, skipping file copy.")
+
 def upper():
     logging.info("Processing upper layer...")
     packages = genpack_json.get("packages", [])
@@ -530,12 +541,7 @@ def upper():
         logging.info("Creating user %s..." % name)
         upper_exec(lower_image, upper_dir, useradd_cmd)
 
-    # copy files
-    if os.path.isdir("files"):
-        logging.info("Copying files from 'files' directory to upper directory.")
-        subprocess.run(sudo(['cp', '-rdv', 'files/.', upper_dir]), check=True)
-    else:
-        logging.info("No 'files' directory found, skipping file copy.")
+    copy_upper_files()
 
     # execute build sctript if exists
     build_script = os.path.join(upper_dir, "build")
@@ -587,15 +593,18 @@ def upper():
 def upper_bash():
     if not os.path.isdir(upper_dir):
         raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
+    copy_upper_files()    
     logging.info("Running bash in the upper directory for debugging.")
     upper_exec(lower_image, upper_dir, "bash")
 
 def pack():
+    global compression
     if not os.path.isdir(upper_dir):
         raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
     name = genpack_json["name"]
     outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
-    compression = genpack_json.get("compression", "gzip")
+    if compression is None:
+        compression = genpack_json.get("compression", "gzip")
     cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
     if compression == "xz": cmdline += ["-comp", "xz", "-b", "1M"]
     elif compression == "gzip": cmdline += ["-Xcompression-level", "1"]
@@ -615,7 +624,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--overlay-override", default=None, help="Directory to override genpack-overlay")
-    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "pack"], nargs="?", default="build", help="Action to perform")
+    parser.add_argument("--compression", choices=["gzip", "xz", "lzo", "none"], default=None, help="Compression type for the final SquashFS image")
+    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "upper-clean", "pack"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
@@ -657,12 +667,18 @@ if __name__ == "__main__":
             logging.info("Created .vscode/settings.json with default settings.")
     
     overlay_override = args.overlay_override
+    compression = args.compression
 
     if args.action == "bash":
         bash()
         exit(0)
     elif args.action == "upper-bash":
         upper_bash()
+        exit(0)
+    elif args.action == "upper-clean":
+        if os.path.isdir(upper_dir):
+            logging.info(f"Removing upper directory: {upper_dir}")
+            subprocess.run(sudo(['rm', '-rf', upper_dir]), check=True)
         exit(0)
     #else
     if args.action in ["build", "lower"]:
