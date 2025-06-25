@@ -252,7 +252,9 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         if use is None: use = {}
         if license is None: license = {}
 
-        accept_keywords_file = os.path.join(mount_point, "etc/portage/package.accept_keywords/genpack")
+        etc_portage_dir = os.path.join(mount_point, "etc/portage")
+
+        accept_keywords_file = os.path.join(etc_portage_dir, "package.accept_keywords/genpack")
         logging.info(f"Applying accept keywords to {accept_keywords_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(accept_keywords_file)]), check=True)
         tee = subprocess.Popen(sudo(['tee', accept_keywords_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
@@ -268,7 +270,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
             tee.stdin.close()
             tee.wait()
 
-        use_file = os.path.join(mount_point, "etc/portage/package.use/genpack")
+        use_file = os.path.join(etc_portage_dir, "package.use/genpack")
         logging.info(f"Applying USE flags to {use_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(use_file)]), check=True)
         tee = subprocess.Popen(sudo(['tee', use_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
@@ -283,8 +285,8 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         finally:
             tee.stdin.close()
             tee.wait()
-        
-        license_file = os.path.join(mount_point, "etc/portage/package.license/genpack")
+
+        license_file = os.path.join(etc_portage_dir, "package.license/genpack")
         logging.info(f"Applying LICENSE flags to {license_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(license_file)]), check=True)
         tee = subprocess.Popen(sudo(['tee', license_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
@@ -299,8 +301,8 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         finally:
             tee.stdin.close()
             tee.wait()
-        
-        mask_file = os.path.join(mount_point, "etc/portage/package.mask/genpack")
+
+        mask_file = os.path.join(etc_portage_dir, "package.mask/genpack")
         logging.info(f"Applying masked packages to {mask_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(mask_file)]), check=True)
         tee = subprocess.Popen(sudo(['tee', mask_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
@@ -310,8 +312,23 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         finally:
             tee.stdin.close()
             tee.wait()
-        
-        #TODO: patches, savedconfig
+
+        savedconfig_dir = os.path.join(etc_portage_dir, "savedconfig")
+        if os.path.isdir("savedconfig"):
+            logging.info(f"Installing savedconfig...")
+            subprocess.run(sudo(['rsync', '-rlptD', "--delete", "savedconfig", etc_portage_dir]), check=True)
+        elif os.path.exists(savedconfig_dir):
+            logging.info(f"Removing existing savedconfig directory {savedconfig_dir}")
+            subprocess.run(sudo(['rm', '-rf', savedconfig_dir]), check=True)
+
+        patches_dir = os.path.join(etc_portage_dir, "patches")
+        if os.path.isdir("patches"):
+            logging.info(f"Installing patches...")
+            subprocess.run(sudo(['rsync', '-rlptD', "--delete", "patches ", etc_portage_dir]), check=True)
+        elif os.path.exists(patches_dir):
+            logging.info(f"Removing existing patches directory {patches_dir}")
+            subprocess.run(sudo(['rm', '-rf', patches_dir]), check=True)
+
 
 def set_gentoo_profile(lower_image, profile_name):
     with TempMount(lower_image) as mount_point:
