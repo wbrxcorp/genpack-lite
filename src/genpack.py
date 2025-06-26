@@ -252,7 +252,8 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         if use is None: use = {}
         if license is None: license = {}
 
-        etc_portage_dir = os.path.join(mount_point, "etc/portage")
+        etc_dir = os.path.join(mount_point, "etc")
+        etc_portage_dir = os.path.join(etc_dir, "portage")
 
         accept_keywords_file = os.path.join(etc_portage_dir, "package.accept_keywords/genpack")
         logging.info(f"Applying accept keywords to {accept_keywords_file}")
@@ -313,6 +314,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
             tee.stdin.close()
             tee.wait()
 
+        # apply savedconfig
         savedconfig_dir = os.path.join(etc_portage_dir, "savedconfig")
         if os.path.isdir("savedconfig"):
             logging.info(f"Installing savedconfig...")
@@ -321,6 +323,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
             logging.info(f"Removing existing savedconfig directory {savedconfig_dir}")
             subprocess.run(sudo(['rm', '-rf', savedconfig_dir]), check=True)
 
+        # apply patches
         patches_dir = os.path.join(etc_portage_dir, "patches")
         if os.path.isdir("patches"):
             logging.info(f"Installing patches...")
@@ -328,7 +331,15 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         elif os.path.exists(patches_dir):
             logging.info(f"Removing existing patches directory {patches_dir}")
             subprocess.run(sudo(['rm', '-rf', patches_dir]), check=True)
-
+        
+        # apply kernel config
+        kernel_dir = os.path.join(etc_dir, "kernel")
+        if os.path.isdir("kernel"):
+            logging.info(f"Installing kernel config...")
+            subprocess.run(sudo(['rsync', '-rlptD', "--delete", "kernel", etc_dir]), check=True)
+        elif os.path.exists(kernel_dir):
+            logging.info(f"Removing existing kernel directory {kernel_dir}")
+            subprocess.run(sudo(['rm', '-rf', kernel_dir]), check=True)
 
 def set_gentoo_profile(lower_image, profile_name):
     with TempMount(lower_image) as mount_point:
