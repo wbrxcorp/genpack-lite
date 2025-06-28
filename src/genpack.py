@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-import os,logging,tempfile,subprocess,re,json,argparse,json
+import os,logging,tempfile,subprocess,re,json,argparse,json,hashlib
 from datetime import datetime
 
 import json5 # dev-python/json5
@@ -20,6 +20,10 @@ user_agent = "genpack/0.1"
 overlay_override = None
 compression = None
 genpack_json = None
+
+mixin_root = os.path.join(work_root, "mixins")
+mixins = []
+mixin_genpack_json = {}
 
 def sudo(cmd):
     # if current user is root, just return the command
@@ -213,6 +217,43 @@ def upper_exec(lower_image, upper_dir, cmdline, user=None):
         nspawn_cmdline.append(f"--user={user}")
     subprocess.check_call(sudo(nspawn_cmdline + cmdline))
 
+def download_mixins():
+    global mixins, mixin_genpack_json
+    mixins_tmp = genpack_json.get("mix-in", None)
+    if mixins_tmp is None:
+        return
+    #else
+
+    if isinstance(mixins_tmp, str):
+        mixins_tmp = [mixins_tmp]
+    elif not isinstance(mixins_tmp, list):
+        raise ValueError("mixins must be a string or a list of strings")
+
+    if not os.path.isdir(mixin_root):
+        os.makedirs(mixin_root, exist_ok=True)
+
+    for mixin in mixins_tmp:
+        if not isinstance(mixin, str):
+            raise ValueError("mixin must be a string")
+        #else
+        # treat sha-256 hash of mixin name as an identifier
+        mixin_id = hashlib.sha256(mixin.encode('utf-8')).hexdigest()
+        mixin_dir = os.path.join(mixin_root, mixin_id)
+        if os.path.isdir(mixin_dir):
+            # perform git pull
+            logging.info(f"Mixin {mixin} already exists, updating...")
+            try:
+                subprocess.run(['git', '-C', mixin_dir, 'pull'], check=True)
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to update mix-in {mixin}({mixin_id}). Proceeding without updating.  If you need to reset mix-ins, remove the directory {mixin_dir} and try again.")
+                continue
+        else:
+            # perform git clone
+            logging.info(f"Downloading mix-in {mixin}...")
+            subprocess.run(['git', 'clone', mixin, mixin_dir], check=True)
+        mixin_genpack_json[mixin_id] = load_genpack_json(mixin_dir)
+        mixins.append(mixin_id)
+
 def sync_genpack_overlay(lower_image):
     with TempMount(lower_image) as mount_point:
         genpack_overlay_dir = os.path.join(mount_point, "var/db/repos/genpack-overlay")
@@ -381,6 +422,43 @@ def set_gentoo_profile(lower_image, profile_name):
         subprocess.run(sudo(['chroot', mount_point, "eselect", "profile", "set", exact_profile]), check=True)
         logging.info(f"Gentoo profile set to {exact_profile} successfully.")
 
+def load_genpack_json(directory="."):
+    json_parser, json_file = None, None
+
+    genpack_json5 = os.path.join(directory, "genpack.json5")
+    if os.path.isfile(genpack_json5):
+        json_parser = json5
+        json_file = genpack_json5
+    genpack_json = os.path.join(directory, "genpack.json")
+    if os.path.isfile(genpack_json):
+        if json_parser is None:
+            json_parser = json
+            json_file = genpack_json
+        else:
+            raise ValueError("Both genpack.json5 and genpack.json found. Please remove one of them.")
+    if json_file is None:
+        raise FileNotFoundError("""Neither genpack.json5 nor genpack.json file found. `echo '{"packages":["genpack/paravirt"]}' > genpack.json5` or so to create the minimal one.""")
+
+    #else
+    return json_parser.load(open(json_file, "r"))
+
+def get_packages_from_genpack_json(include_buildtime=False):
+    """Get packages from genpack.json."""
+    packages = []
+    for mixin_id in mixins:
+        if mixin_id not in mixin_genpack_json: continue
+        #else
+        mixin_json = mixin_genpack_json[mixin_id]
+        if "packages" in mixin_json:
+            packages += mixin_json["packages"]
+        if include_buildtime and "buildtime-packages" in mixin_json:
+            packages += mixin_json["buildtime-packages"]
+
+    packages = genpack_json.get("packages", [])
+    if include_buildtime:
+        packages += genpack_json.get("buildtime-packages", [])
+    return packages
+
 def lower():
     logging.info("Processing lower layer...")
     os.makedirs(work_dir, exist_ok=True)
@@ -458,8 +536,7 @@ def lower():
     lower_exec(lower_image, ["sh", "-c", emerge_genpack_progs_cmd])
 
     logging.info("Emerging specified packages...")
-    packages = genpack_json.get("packages", [])
-    packages += genpack_json.get("buildtime-packages", [])
+    packages = get_packages_from_genpack_json(include_buildtime=True)
     if len(packages) > 0:
         lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going", "world"] + packages)
 
@@ -481,6 +558,15 @@ def bash():
 def copy_upper_files():
     if not os.path.isdir(upper_dir):
         raise FileNotFoundError(f"Upper directory {upper_dir} does not exist.")
+    # copy mixin files
+    for mixin_id in mixins:
+        mixin_dir = os.path.join(mixin_root, mixin_id)
+        mixin_files = os.path.join(mixin_dir, "files")
+        if not os.path.isdir(mixin_files): continue
+        #else
+        logging.info(f"Copying files from mix-in {mixin_id} to upper directory.")
+        subprocess.run(sudo(['cp', '-rdv', mixin_files + '/.', upper_dir]), check=True)
+
     # copy files
     if os.path.isdir("files"):
         logging.info("Copying files from 'files' directory to upper directory.")
@@ -490,7 +576,7 @@ def copy_upper_files():
 
 def upper():
     logging.info("Processing upper layer...")
-    packages = genpack_json.get("packages", [])
+    packages = get_packages_from_genpack_json(include_buildtime=False)
     if len(packages) == 0:
         logging.info("No packages specified in genpack.json.")
         return
@@ -657,24 +743,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
-    json_parser, json_file = None, None
-    if os.path.isfile("genpack.json5"):
-        json_parser = json5
-        json_file = "genpack.json5"
-    if os.path.isfile("genpack.json"):
-        if json_parser is None:
-            json_parser = json
-            json_file = "genpack.json"
-        else:
-            raise ValueError("Both genpack.json5 and genpack.json files found. Please remove one of them.")
-    if json_file is None:
-        raise FileNotFoundError("Neither genpack.json5 nor genpack.json file found. Please create one of them.")
-    #else
-    with open(json_file, "r") as f:
-        genpack_json = json_parser.load(f)
+    genpack_json = load_genpack_json()
     if "name" not in genpack_json:
-        genpack_json["name"] = os.path.basename(os.path.dirname(os.path.abspath(json_file)))
-        logging.warning(f"'name' not found in {json_file}, using default: {genpack_json['name']}")  
+        genpack_json["name"] = os.path.basename(os.getcwd())
+        logging.warning(f"'name' not found in genpack.json. using default: {genpack_json['name']}")  
 
     if not os.path.isfile(".gitignore"):
         with open(".gitignore", "w") as f:
@@ -696,6 +768,8 @@ if __name__ == "__main__":
     
     overlay_override = args.overlay_override
     compression = args.compression
+
+    download_mixins()    
 
     if args.action == "bash":
         bash()
