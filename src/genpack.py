@@ -444,20 +444,20 @@ def load_genpack_json(directory="."):
 
 def get_packages_from_genpack_json(include_buildtime=False):
     """Get packages from genpack.json."""
-    packages = []
+    packages = set()
     for mixin_id in mixins:
         if mixin_id not in mixin_genpack_json: continue
         #else
         mixin_json = mixin_genpack_json[mixin_id]
         if "packages" in mixin_json:
-            packages += mixin_json["packages"]
+            packages.update(mixin_json["packages"])
         if include_buildtime and "buildtime-packages" in mixin_json:
-            packages += mixin_json["buildtime-packages"]
+            packages.update(mixin_json["buildtime-packages"])
 
-    packages = genpack_json.get("packages", [])
+    packages.update(genpack_json.get("packages", []))
     if include_buildtime:
-        packages += genpack_json.get("buildtime-packages", [])
-    return packages
+        packages.update(genpack_json.get("buildtime-packages", []))
+    return list(packages)
 
 def lower():
     logging.info("Processing lower layer...")
