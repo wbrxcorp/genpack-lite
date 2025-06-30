@@ -177,7 +177,7 @@ def lower_exec(lower_image, cmdline, env=None):
     os.makedirs(cache_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, f"--image={lower_image}",
-        "--capability=CAP_MKNOD,CAP_SYS_ADMIN",
+        "--capability=CAP_MKNOD,CAP_SYS_ADMIN,CAP_NET_ADMIN", # Portage's network sandbox needs CAP_NET_ADMIN
         "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
     ]
     if overlay_override is not None:
@@ -635,9 +635,9 @@ def upper():
         if "additional_groups" in user:
             raise Exception("Use 'additional-groups' instead of 'additional_groups'")
         additional_groups = user.get("additional-groups", [])
-        if isinstance(user["additional-groups"], str):
+        if isinstance(additional_groups, str):
             additional_groups = [additional_groups]
-        elif not isinstance(user["additional-groups"], list):
+        elif not isinstance(additional_groups, list):
             raise Exception("additional-groups must be list or string")
         if "shell" in user: shell = user["shell"]
         empty_password = user.get("empty-password", False)
