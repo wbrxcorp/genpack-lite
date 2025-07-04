@@ -11,13 +11,19 @@ DEFAULT_LOWER_TOTAL_SIZE_IN_GIB = 20  # Default total size for lower image in Gi
 OVERLAY_SOURCE = "https://github.com/wbrxcorp/genpack-overlay.git"
 
 arch = os.uname().machine
+
 work_root = "work"
 work_dir = os.path.join(work_root, arch)
 lower_image = os.path.join(work_dir, "lower.img")
 upper_dir = os.path.join(work_dir, "upper")
+
+cache_root = os.path.join(os.path.expanduser("~"), ".cache/genpack")
+cache_dir = os.path.join(cache_root, arch)
+
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
 overlay_override = None
+independent_binpkgs = False
 compression = None
 genpack_json = None
 
@@ -173,13 +179,17 @@ def lower_exec(lower_image, cmdline, env=None):
         cmdline = [cmdline]
     # use PID for container name
     container_name = "genpack-%d" % os.getpid()
-    cache_dir = os.path.join(work_dir, "cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    work_cache_dir = os.path.join(work_dir, "cache")
+    os.makedirs(work_cache_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, f"--image={lower_image}",
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN,CAP_NET_ADMIN", # Portage's network sandbox needs CAP_NET_ADMIN
-        "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
+        "--bind=%s:/var/cache" % os.path.abspath(work_cache_dir),
     ]
+    if not independent_binpkgs:
+        binpkgs_dir = os.path.join(cache_dir, "binpkgs")
+        os.makedirs(binpkgs_dir, exist_ok=True)
+        nspawn_cmdline.append(f"--bind={binpkgs_dir}:/var/cache/binpkgs:rootidmap")
     if overlay_override is not None:
         if not os.path.isdir(overlay_override):
             raise ValueError("overlay-override must be a directory")
@@ -203,11 +213,11 @@ def upper_exec(lower_image, upper_dir, cmdline, user=None):
     # convert command to list if it is string
     if isinstance(cmdline, str): cmdline = [cmdline]
     container_name = "genpack-%d" % os.getpid()
-    cache_dir = os.path.join(work_dir, "cache")
+    work_cache_dir = os.path.join(work_dir, "cache")
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, 
         f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
-        "--bind=%s:/var/cache" % os.path.abspath(cache_dir),
+        "--bind=%s:/var/cache" % os.path.abspath(work_cache_dir),
         "--capability=CAP_MKNOD",
         "-E", f"ARTIFACT={genpack_json["name"]}"]
     if user is not None:
@@ -545,7 +555,9 @@ def lower():
     cleanup_cmd += " && emerge --depclean"
     cleanup_cmd += " && etc-update --automode -5"
     cleanup_cmd += " && eclean-dist -d"
-    cleanup_cmd += " && eclean-pkg -d"
+    cleanup_cmd += " && eclean-pkg"
+    if independent_binpkgs:
+        cleanup_cmd += " -d" # with independent binpkgs, we can clean up binpkgs more aggressively
     lower_exec(lower_image, ["sh", "-c", cleanup_cmd])
 
     #with open(os.path.join(work_dir, "lower.done"), "w") as f:
@@ -738,6 +750,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--overlay-override", default=None, help="Directory to override genpack-overlay")
+    parser.add_argument("--independent-binpkgs", action="store_true", help="Use independent binpkgs, do not use shared one")
     parser.add_argument("--compression", choices=["gzip", "xz", "lzo", "none"], default=None, help="Compression type for the final SquashFS image")
     parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "upper-clean", "pack"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
@@ -767,6 +780,12 @@ if __name__ == "__main__":
             logging.info("Created .vscode/settings.json with default settings.")
     
     overlay_override = args.overlay_override
+
+    if args.independent_binpkgs:
+        independent_binpkgs = True
+    else:
+        independent_binpkgs = genpack_json.get("independent-binpkgs", False)
+
     compression = args.compression
 
     download_mixins()    
