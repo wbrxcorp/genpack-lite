@@ -531,28 +531,54 @@ def lower():
     mask = genpack_json.get("mask", [])
     apply_portage_flags(lower_image, accept_keywords, use, license, mask)
 
-    # circurlar dependency breaker
+    # binpkg_exclude
+    binpkg_exclude = genpack_json.get("binpkg-exclude", [])
+    if isinstance(binpkg_exclude, str):
+        binpkg_exclude = [binpkg_exclude]
+    elif not isinstance(binpkg_exclude, list):
+        raise ValueError("binpkg-exclude must be a string or a list of strings")
+
+    # circular dependency breaker
     if "circulardep-breaker" in genpack_json:
         circulardep_breaker_packages = genpack_json["circulardep-breaker"].get("packages", [])
         circulardep_breaker_use = genpack_json["circulardep-breaker"].get("use", None)
         if len(circulardep_breaker_packages) > 0:
             logging.info("Emerging circular dependency breaker packages...")
             env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
-            lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-u"] + circulardep_breaker_packages, env)
+            emerge_cmd = ["emerge", "-bk", "-u", "--keep-going"]
+            if len(binpkg_exclude) > 0:
+                emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
+                emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+            emerge_cmd += circulardep_breaker_packages
+            lower_exec(lower_image, emerge_cmd, env)
 
     logging.info("Emerging genpack-progs...")
-    emerge_genpack_progs_cmd = "emerge -bk --binpkg-respect-use=y -uDN genpack-progs --keep-going"
-    emerge_genpack_progs_cmd += " && emaint binhost --fix"
-    lower_exec(lower_image, ["sh", "-c", emerge_genpack_progs_cmd])
+    emerge_cmd = ["emerge", "-bk", "-uN", "--keep-going"]
+    if len(binpkg_exclude) > 0:
+        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
+        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+    emerge_cmd += ["genpack-progs"]
+    lower_exec(lower_image, emerge_cmd)
 
     logging.info("Emerging specified packages...")
     packages = get_packages_from_genpack_json(include_buildtime=True)
     if len(packages) > 0:
-        lower_exec(lower_image, ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going", "world"] + packages)
+        emerge_cmd = ["emerge", "-bk", "-uDN", "--keep-going"]
+        if len(binpkg_exclude) > 0:
+            emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
+            emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+        lower_exec(lower_image, emerge_cmd + ["world"] + packages)
+
+    logging.info("Rebuilding preserved packages...")
+    emerge_cmd = ["emerge", "-bk"]
+    if len(binpkg_exclude) > 0:
+        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
+        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+    emerge_cmd += ["@preserved-rebuild"]
+    lower_exec(lower_image, emerge_cmd)
 
     logging.info("Cleaning up...")
-    cleanup_cmd = "emerge -bk --binpkg-respect-use=y @preserved-rebuild"
-    cleanup_cmd += " && emerge --depclean"
+    cleanup_cmd = "emerge --depclean"
     cleanup_cmd += " && etc-update --automode -5"
     cleanup_cmd += " && eclean-dist -d"
     cleanup_cmd += " && eclean-pkg"
