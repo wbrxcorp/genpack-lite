@@ -6,7 +6,7 @@ all:
 	@echo "Use 'make install' to install the script."
 
 install: src/genpack.py
-	@echo "Installing webappviewer to $(PYTHON_USER_SITE)"
+	@echo "Installing genpack to $(PYTHON_USER_SITE)"
 	mkdir -p $(PYTHON_USER_SITE)
 	cp src/genpack.py $(PYTHON_USER_SITE)/genpack.py
 	@echo "Installation complete. You can now run 'python -m genpack' from the command line."
