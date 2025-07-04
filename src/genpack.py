@@ -545,32 +545,24 @@ def lower():
         if len(circulardep_breaker_packages) > 0:
             logging.info("Emerging circular dependency breaker packages...")
             env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
-            emerge_cmd = ["emerge", "-bk", "-u", "--keep-going"]
+            emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-u", "--keep-going"]
             if len(binpkg_exclude) > 0:
                 emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
                 emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
             emerge_cmd += circulardep_breaker_packages
             lower_exec(lower_image, emerge_cmd, env)
 
-    logging.info("Emerging genpack-progs...")
-    emerge_cmd = ["emerge", "-bk", "-uN", "--keep-going"]
-    if len(binpkg_exclude) > 0:
-        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
-        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
-    emerge_cmd += ["genpack-progs"]
-    lower_exec(lower_image, emerge_cmd)
-
-    logging.info("Emerging specified packages...")
+    logging.info("Emerging all packages...")
     packages = get_packages_from_genpack_json(include_buildtime=True)
     if len(packages) > 0:
-        emerge_cmd = ["emerge", "-bk", "-uDN", "--keep-going"]
+        emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going"]
         if len(binpkg_exclude) > 0:
             emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
             emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
-        lower_exec(lower_image, emerge_cmd + ["world"] + packages)
+        lower_exec(lower_image, emerge_cmd + ["@world", "genpack-progs"] + packages)
 
     logging.info("Rebuilding preserved packages...")
-    emerge_cmd = ["emerge", "-bk"]
+    emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y"]
     if len(binpkg_exclude) > 0:
         emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
         emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
