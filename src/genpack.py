@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-import os,logging,tempfile,subprocess,re,json,argparse,json,hashlib
+import os,logging,tempfile,subprocess,re,json,argparse,json,hashlib,time
 from datetime import datetime
 
 import json5 # dev-python/json5
@@ -15,17 +15,22 @@ arch = os.uname().machine
 work_root = "work"
 work_dir = os.path.join(work_root, arch)
 lower_image = os.path.join(work_dir, "lower.img")
+lower_files = os.path.join(work_dir, "lower.files")
 upper_dir = os.path.join(work_dir, "upper")
 
 cache_root = os.path.join(os.path.expanduser("~"), ".cache/genpack")
-cache_dir = os.path.join(cache_root, arch)
+cache_arch_dir = os.path.join(cache_root, arch)
+binpkgs_dir = os.path.join(cache_arch_dir, "binpkgs")
+download_dir = os.path.join(cache_root, "download")
 
 base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
 overlay_override = None
 independent_binpkgs = False
 compression = None
+devel = False
 genpack_json = None
+genpack_json_time = None
 
 mixin_root = os.path.join(work_root, "mixins")
 mixins = []
@@ -156,6 +161,9 @@ def setup_lower_image(lower_image, stage3_tarball, portage_tarball):
             portage_dir = os.path.join(mount_point, "var/db/repos/gentoo")
             subprocess.run(sudo(["mkdir", "-p", portage_dir]), check=True)
             subprocess.run(sudo(['tar', 'xpf', portage_tarball, '-C', portage_dir, "--strip-components=1"]), check=True)
+            # workaround for https://bugs.gentoo.org/734000
+            subprocess.run(sudo(['chroot', mount_point, "chown", "portage", "/var/cache/distfiles"]), check=True)
+            subprocess.run(sudo(['chroot', mount_point, "chmod", "g+w", "/var/cache/distfiles"]), check=True)
     except Exception as e:
         logging.error(f"Error setting up lower image: {e}")
         os.remove(lower_image)  # Clean up the image
@@ -179,15 +187,11 @@ def lower_exec(lower_image, cmdline, env=None):
         cmdline = [cmdline]
     # use PID for container name
     container_name = "genpack-%d" % os.getpid()
-    work_cache_dir = os.path.join(work_dir, "cache")
-    os.makedirs(work_cache_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, f"--image={lower_image}",
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN,CAP_NET_ADMIN", # Portage's network sandbox needs CAP_NET_ADMIN
-        "--bind=%s:/var/cache" % os.path.abspath(work_cache_dir),
     ]
     if not independent_binpkgs:
-        binpkgs_dir = os.path.join(cache_dir, "binpkgs")
         os.makedirs(binpkgs_dir, exist_ok=True)
         nspawn_cmdline.append(f"--bind={binpkgs_dir}:/var/cache/binpkgs:rootidmap")
     if overlay_override is not None:
@@ -213,12 +217,12 @@ def upper_exec(lower_image, upper_dir, cmdline, user=None):
     # convert command to list if it is string
     if isinstance(cmdline, str): cmdline = [cmdline]
     container_name = "genpack-%d" % os.getpid()
-    work_cache_dir = os.path.join(work_dir, "cache")
+    os.makedirs(download_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, 
         f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
-        "--bind=%s:/var/cache" % os.path.abspath(work_cache_dir),
-        "--capability=CAP_MKNOD",
+        "--bind=%s:/var/cache/download:rootidmap" % os.path.abspath(download_dir),
+        "--capability=CAP_MKNOD,CAP_NET_ADMIN",
         "-E", f"ARTIFACT={genpack_json["name"]}"]
     if user is not None:
         if not isinstance(user, str):
@@ -296,15 +300,66 @@ def sync_genpack_overlay(lower_image):
             tee.stdin.write("sys-kernel/installkernel dracut\n")
             tee.stdin.close()
             tee.wait()
+        overlay_checkfiles = os.listdir(genpack_overlay_dir)
+        overlay_checkfiles.remove(".git")
+        overlay_checkfiles.append(".git/ORIG_HEAD")
+        return get_latest_mtime(*(os.path.join(genpack_overlay_dir, f) for f in overlay_checkfiles if os.path.exists(os.path.join(genpack_overlay_dir, f))))
 
-def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
+def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packages, devel_packages, accept_keywords, use, license, mask):
     with TempMount(lower_image) as mount_point:
         if accept_keywords is None: accept_keywords = {}
         if use is None: use = {}
         if license is None: license = {}
+        if buildtime_packages is None: buildtime_packages = []
 
         etc_dir = os.path.join(mount_point, "etc")
         etc_portage_dir = os.path.join(etc_dir, "portage")
+
+        if not isinstance(runtime_packages, list):
+            raise ValueError("runtime_packages must be a list")
+        #else
+
+        sets_dir = os.path.join(etc_portage_dir, "sets")
+
+        runtime_packages_file = os.path.join(sets_dir, "genpack-runtime")
+        subprocess.run(sudo(["chroot", mount_point, "mkdir", "-p", "/etc/portage/sets"]), check=True)
+        logging.info(f"Applying runtime packages to {runtime_packages_file}")
+        tee = subprocess.Popen(sudo(['tee', runtime_packages_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+        try:
+            for pkg in runtime_packages:
+                tee.stdin.write(f"{pkg}\n")
+        finally:
+            tee.stdin.close()
+            tee.wait()
+        
+        if not isinstance(buildtime_packages, list):
+            raise ValueError("buildtime_packages must be a list or None")
+        #else
+        buildtime_packages_file = os.path.join(sets_dir, "genpack-buildtime")
+        logging.info(f"Applying buildtime packages to {buildtime_packages_file}")
+        tee = subprocess.Popen(sudo(['tee', buildtime_packages_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+        try:
+            for pkg in buildtime_packages:
+                tee.stdin.write(f"{pkg}\n")
+        finally:
+            tee.stdin.close()
+            tee.wait()
+
+        if devel_packages is not None:        
+            if not isinstance(devel_packages, list):
+                raise ValueError("devel_packages must be a list or None")
+            #else
+            devel_packages_file = os.path.join(sets_dir, "genpack-devel")
+            logging.info(f"Applying devel packages to {devel_packages_file}")
+            tee = subprocess.Popen(sudo(['tee', devel_packages_file]), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+            try:
+                for pkg in devel_packages:
+                    tee.stdin.write(f"{pkg}\n")
+            finally:
+                tee.stdin.close()
+                tee.wait()
+        else:
+            subprocess.run(sudo(['rm', '-f', os.path.join(sets_dir, "genpack-devel")]), check=True)
 
         accept_keywords_file = os.path.join(etc_portage_dir, "package.accept_keywords/genpack")
         logging.info(f"Applying accept keywords to {accept_keywords_file}")
@@ -378,7 +433,7 @@ def apply_portage_flags(lower_image, accept_keywords, use, license, mask):
         patches_dir = os.path.join(etc_portage_dir, "patches")
         if os.path.isdir("patches"):
             logging.info(f"Installing patches...")
-            subprocess.run(sudo(['rsync', '-rlptD', "--delete", "patches ", etc_portage_dir]), check=True)
+            subprocess.run(sudo(['rsync', '-rlptD', "--delete", "patches", etc_portage_dir]), check=True)
         elif os.path.exists(patches_dir):
             logging.info(f"Removing existing patches directory {patches_dir}")
             subprocess.run(sudo(['rm', '-rf', patches_dir]), check=True)
@@ -450,23 +505,22 @@ def load_genpack_json(directory="."):
         raise FileNotFoundError("""Neither genpack.json5 nor genpack.json file found. `echo '{"packages":["genpack/paravirt"]}' > genpack.json5` or so to create the minimal one.""")
 
     #else
-    return json_parser.load(open(json_file, "r"))
+    return (json_parser.load(open(json_file, "r")), os.path.getmtime(json_file))
 
-def get_packages_from_genpack_json(include_buildtime=False):
+def get_packages_from_genpack_json(package_set_type = "runtime"):
     """Get packages from genpack.json."""
+    if package_set_type not in ["runtime", "buildtime", "devel"]:
+        raise ValueError("package_set_type must be one of 'runtime', 'buildtime', or 'devel'")
+    property_name = f"{package_set_type}-packages" if package_set_type != "runtime" else "packages"
     packages = set()
     for mixin_id in mixins:
         if mixin_id not in mixin_genpack_json: continue
         #else
         mixin_json = mixin_genpack_json[mixin_id]
-        if "packages" in mixin_json:
-            packages.update(mixin_json["packages"])
-        if include_buildtime and "buildtime-packages" in mixin_json:
-            packages.update(mixin_json["buildtime-packages"])
+        if property_name in mixin_json:
+            packages.update(mixin_json[property_name])
 
-    packages.update(genpack_json.get("packages", []))
-    if include_buildtime:
-        packages.update(genpack_json.get("buildtime-packages", []))
+    packages.update(genpack_json.get(property_name, []))
     return list(packages)
 
 def lower():
@@ -510,11 +564,22 @@ def lower():
         with open(portage_saved_headers_path, 'w') as f:
             f.write(headers_to_info(portage_headers))
     
+    latest_mtime = sync_genpack_overlay(lower_image)
+    logging.info(f"Latest genpack-overlay mtime: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_mtime))}")
+    logging.info(f"lower_files time: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(lower_files))) if os.path.exists(lower_files) else 'N/A'}")
+
+    if os.path.exists(lower_files) and (stage3_is_new or portage_is_new or os.path.getmtime(lower_files) < latest_mtime):
+        logging.info(f"Removing old {lower_files} file due to changes in stage3 or portage.")
+        os.remove(lower_files)
+
+    if os.path.exists(lower_files):
+        logging.info("Lower image is up-to-date, skipping.")
+        return
+
     gentoo_profile = genpack_json.get("gentoo-profile", None)
     if gentoo_profile is not None and image_is_new:
         set_gentoo_profile(lower_image, gentoo_profile)
     
-    sync_genpack_overlay(lower_image)
 
     # TODO: read /var/db/repos/genpack-overlay/*/*/genpack-hints.json
 
@@ -529,7 +594,12 @@ def lower():
     } | genpack_json.get("use", {})
     license = genpack_json.get("license", {})
     mask = genpack_json.get("mask", [])
-    apply_portage_flags(lower_image, accept_keywords, use, license, mask)
+
+    apply_portage_sets_and_flags(lower_image, 
+                                get_packages_from_genpack_json("runtime"),
+                                get_packages_from_genpack_json("buildtime"),
+                                get_packages_from_genpack_json("devel") if devel else None,
+                                accept_keywords, use, license, mask)
 
     # binpkg_exclude
     binpkg_exclude = genpack_json.get("binpkg-exclude", [])
@@ -553,13 +623,14 @@ def lower():
             lower_exec(lower_image, emerge_cmd, env)
 
     logging.info("Emerging all packages...")
-    packages = get_packages_from_genpack_json(include_buildtime=True)
-    if len(packages) > 0:
-        emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going"]
-        if len(binpkg_exclude) > 0:
-            emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
-            emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
-        lower_exec(lower_image, emerge_cmd + ["@world", "genpack-progs"] + packages)
+    emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going"]
+    if len(binpkg_exclude) > 0:
+        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
+        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+    emerge_cmd += ["@world", "genpack-progs", "@genpack-runtime", "@genpack-buildtime"]
+    if devel:
+        emerge_cmd += ["@genpack-devel"]
+    lower_exec(lower_image, emerge_cmd)
 
     logging.info("Rebuilding preserved packages...")
     emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y"]
@@ -578,8 +649,33 @@ def lower():
         cleanup_cmd += " -d" # with independent binpkgs, we can clean up binpkgs more aggressively
     lower_exec(lower_image, ["sh", "-c", cleanup_cmd])
 
-    #with open(os.path.join(work_dir, "lower.done"), "w") as f:
-    #    pass
+    files = []
+    with TempMount(lower_image) as mount_point:
+        list_pkg_files = subprocess.Popen(
+            sudo(["chroot", mount_point, "list-pkg-files"]), 
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1)
+        try:
+            for line in list_pkg_files.stdout:
+                line = line.rstrip('\n')
+                if not line or line.startswith('#'): continue
+                #else
+                if not os.path.isabs(line):
+                    raise ValueError(f"list-pkg-files returned non-absolute path: {line}")
+                #else
+                files.append(line.lstrip('/'))  # remove leading slash
+        finally:
+            return_code = list_pkg_files.wait()
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, list_pkg_files.args)
+    
+    with open(lower_files, "w") as f:
+        for file in ["bin", "sbin", "lib", "lib64", "usr/sbin", "run", "proc", "sys", "root", "home", "tmp", "mnt",
+                     "dev", "dev/console", "dev/null"]:
+            files.append(file)
+        for file in sorted(files):
+            f.write(file + '\n')
 
 def bash():
     logging.info("Running bash in the lower image for debugging.")
@@ -606,25 +702,60 @@ def copy_upper_files():
 
 def upper():
     logging.info("Processing upper layer...")
-    packages = get_packages_from_genpack_json(include_buildtime=False)
-    if len(packages) == 0:
-        logging.info("No packages specified in genpack.json.")
-        return
-    #else
-    if os.path.exists(upper_dir):
-        logging.info(f"Upper directory {upper_dir} already exists, removing.")
-        subprocess.run(sudo(['rm', '-rf', upper_dir]), check=True)
+    if not os.path.isfile(lower_image) or not os.path.exists(lower_files):
+        raise FileNotFoundError(f"Lower image {lower_image} or lower files {lower_files} does not exist. Please run 'genpack lower' first.")
+
     subprocess.run(sudo(['mkdir', '-p', upper_dir]), check=True)
-    logging.info(f"Upper directory created: {upper_dir}")
 
-    logging.info("Executing copyup-packages...")
-    cmdline = ["/usr/bin/copyup-packages", "--bind-mount-root", "--toplevel-dirs", "--exec-package-scripts"]
-    cmdline += ["--generate-metadata"]
-    if genpack_json.get("devel", False):
-        cmdline += ["--devel"]
-    cmdline += packages
+    # reset upper dir by deleting files not listed in lower_files
+    logging.info("Deleting upper files not listed in lower files...")
+    files_to_preserve = set()
+    with open(lower_files, "r") as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if not line or line.startswith('#'): continue
+            #else
+            files_to_preserve.add(line)
+            dirname = os.path.dirname(line)
+            while dirname != "":
+                files_to_preserve.add(dirname)
+                dirname = os.path.dirname(dirname)
 
-    upper_exec(lower_image, upper_dir, cmdline)
+    files_to_remove = set()
+    find = subprocess.Popen(sudo(["find", upper_dir, "-printf", "%P\\n"]), stdout=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        for line in find.stdout:
+            line = line.rstrip('\n')
+            if line == "": continue
+            #else
+            files_to_remove.add(line)
+    finally:
+        find.wait()
+    
+    for file in files_to_preserve:
+        if file in files_to_remove:
+            files_to_remove.remove(file)
+
+    # safety check
+    for file in files_to_remove:
+        normalized = os.path.normpath(file)
+        if normalized.startswith("..") or normalized.startswith("/"):
+            raise ValueError(f"File to remove {file} is suspicious.")
+        
+    def chunk_generator(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i : i + n]
+
+    for chunk in chunk_generator(list(files_to_remove), 64):
+        subprocess.run(sudo(["rm", "-rf"] + chunk), check=True, cwd=upper_dir)
+        #subprocess.run(sudo(["pwd"]), check=True, cwd=upper_dir)
+
+    # copy-up from lower to upper
+    logging.info("Copying files from lower image to upper directory...")
+    with TempMount(lower_image) as mount_point:
+        subprocess.run(sudo(["rsync", "-a", f"--files-from={lower_files}", "--relative", mount_point + "/", upper_dir]), check=True)
+    
+    upper_exec(lower_image, upper_dir, ["exec-package-scripts-and-generate-metadata"])
 
     # create groups
     groups = genpack_json.get("groups", [])
@@ -743,26 +874,57 @@ def upper_bash():
 
 def pack():
     global compression
+    if not os.path.isfile(lower_image):
+        raise FileNotFoundError(f"Lower image {lower_image} does not exist. Please run 'lower' first")
     if not os.path.isdir(upper_dir):
         raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
+    #else
+
     name = genpack_json["name"]
     outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
+
     if compression is None:
         compression = genpack_json.get("compression", "gzip")
-    cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
-    if compression == "xz": cmdline += ["-comp", "xz", "-b", "1M"]
-    elif compression == "gzip": cmdline += ["-Xcompression-level", "1"]
-    elif compression == "lzo": cmdline += ["-comp", "lzo"]
-    elif compression == "none": cmdline += ["-no-compression"]
+    
+    compression_opts = []
+    if compression == "xz":
+        compression_opts = ["-comp", "xz", "-b", "1M"]
+    elif compression == "gzip":
+        compression_opts = ["-Xcompression-level", "1"]
+    elif compression == "lzo":
+        compression_opts = ["-comp", "lzo"]
+    elif compression == "none":
+        compression_opts = ["-no-compression"]
     else:
         raise ValueError(f"Unknown compression type: {compression}")
-    cmdline += ["-e", "build", "build.d", "build.d/*"]
+
+    cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
+    cmdline += compression_opts
+    cmdline += ["-e", "build", "build.d", "build.d/*", "var/log/*.log", "var/tmp/*"]
+
     logging.info(f"Creating SquashFS image: {outfile} with compression {compression}")
     if os.path.exists(outfile):
         logging.info(f"Output file {outfile} already exists, removing it.")
         os.remove(outfile)
+    
     subprocess.run(sudo(cmdline), check=True)
-    subprocess.check_call(sudo(["chown", "%d:%d" % (os.getuid(), os.getgid()), outfile]))
+    subprocess.run(sudo(['chown', f"{os.getuid()}:{os.getgid()}", outfile]), check=True)
+
+def get_latest_mtime(*args):
+    latest = 0.0
+    for arg in args:
+        if isinstance(arg, float): latest = max(latest, arg)
+        elif isinstance(arg, str):
+            if os.path.isfile(arg):
+                latest = max(latest, os.path.getmtime(arg))
+            elif os.path.isdir(arg):
+                latest = max(latest, os.path.getmtime(arg), get_latest_mtime(*(os.path.join(arg, f) for f in os.listdir(arg) if os.path.exists(os.path.join(arg, f)))))
+
+        elif isinstance(arg, list):
+            latest = max(latest, get_latest_mtime(*arg))
+
+    logging.debug(f"Latest mtime from {args} is {latest}")
+    return latest
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
@@ -770,11 +932,12 @@ if __name__ == "__main__":
     parser.add_argument("--overlay-override", default=None, help="Directory to override genpack-overlay")
     parser.add_argument("--independent-binpkgs", action="store_true", help="Use independent binpkgs, do not use shared one")
     parser.add_argument("--compression", choices=["gzip", "xz", "lzo", "none"], default=None, help="Compression type for the final SquashFS image")
+    parser.add_argument("--devel", action="store_true", help="Generate development image, if supported by genpack.json")
     parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "upper-clean", "pack"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
-    genpack_json = load_genpack_json()
+    genpack_json, genpack_json_time = load_genpack_json()
     if "name" not in genpack_json:
         genpack_json["name"] = os.path.basename(os.getcwd())
         logging.warning(f"'name' not found in genpack.json. using default: {genpack_json['name']}")  
@@ -799,6 +962,11 @@ if __name__ == "__main__":
     
     overlay_override = args.overlay_override
 
+    if args.devel:
+        devel = True
+    else:
+        devel = genpack_json.get("devel", False)
+
     if args.independent_binpkgs:
         independent_binpkgs = True
     else:
@@ -806,7 +974,7 @@ if __name__ == "__main__":
 
     compression = args.compression
 
-    download_mixins()    
+    download_mixins()
 
     if args.action == "bash":
         bash()
@@ -820,7 +988,15 @@ if __name__ == "__main__":
             subprocess.run(sudo(['rm', '-rf', upper_dir]), check=True)
         exit(0)
     #else
+
     if args.action in ["build", "lower"]:
+        if os.path.exists(lower_files):
+            latest_mtime = get_latest_mtime(genpack_json_time, "savedconfig", "patches", "kernel", mixin_root)
+            if os.path.getmtime(lower_files) < latest_mtime:
+                logging.info(f"Lower files {lower_files} is outdated, rebuilding lower layer.")
+                os.remove(lower_files)
+            if args.action == "lower":
+                os.remove(lower_files)
         lower()
     if args.action in ["build", "upper"]:
         upper()

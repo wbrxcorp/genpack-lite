@@ -1,4 +1,3 @@
 {
-    "gentoo-profile": "desktop/gnome/systemd",
     "packages": ["genpack/paravirt"]
 }
