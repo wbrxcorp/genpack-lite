@@ -580,15 +580,13 @@ def lower():
     if gentoo_profile is not None and image_is_new:
         set_gentoo_profile(lower_image, gentoo_profile)
     
-
-    # TODO: read /var/db/repos/genpack-overlay/*/*/genpack-hints.json
-
     accept_keywords = {
         "dev-cpp/argparse":None # argparse is required for genpack-progs
     } | genpack_json.get("accept_keywords", {})
     use = {
         "sys-libs/glibc": "audit", # Intentionally causing glibc to be rebuilt
         "sys-kernel/installkernel":"dracut", # genpack depends on dracut
+        "app-crypt/libb2":"-openmp", # openmp support brings gcc dependency, which is not generally needed for genpack
         "dev-lang/perl":"minimal",
         "app-editors/vim":"minimal"
     } | genpack_json.get("use", {})
@@ -995,7 +993,7 @@ if __name__ == "__main__":
             if os.path.getmtime(lower_files) < latest_mtime:
                 logging.info(f"Lower files {lower_files} is outdated, rebuilding lower layer.")
                 os.remove(lower_files)
-            if args.action == "lower":
+            elif args.action == "lower":
                 os.remove(lower_files)
         lower()
     if args.action in ["build", "upper"]:
