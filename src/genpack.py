@@ -6,8 +6,7 @@ from datetime import datetime
 import json5 # dev-python/json5
 import requests # dev-python/requests
 
-DEFAULT_LOWER_INITIAL_ALLOCATION_SIZE_IN_GIB = 2  # Default initial allocation size for lower image in GiB
-DEFAULT_LOWER_TOTAL_SIZE_IN_GIB = 20  # Default total size for lower image in GiB
+DEFAULT_LOWER_SIZE_IN_GIB = 20  # Default total size for lower image in GiB
 OVERLAY_SOURCE = "https://github.com/wbrxcorp/genpack-overlay.git"
 
 arch = os.uname().machine
@@ -132,31 +131,18 @@ class TempMount:
 
 def setup_lower_image(lower_image, stage3_tarball, portage_tarball):
     # create image file
-    lower_initial_allocation_size_in_gib = genpack_json.get("minimum-lower-layer-capacity", DEFAULT_LOWER_INITIAL_ALLOCATION_SIZE_IN_GIB)
-    lower_total_size_in_gib = max(lower_initial_allocation_size_in_gib * 2, DEFAULT_LOWER_TOTAL_SIZE_IN_GIB)
-    if lower_initial_allocation_size_in_gib > lower_total_size_in_gib:
-        raise ValueError("Initial allocation size must be less than or equal to total size.")
-    logging.info(f"Creating image file at {lower_image} with size {lower_initial_allocation_size_in_gib} GiB (initial) and {lower_total_size_in_gib} GiB (total).")
+    lower_size_in_gib = genpack_json.get("lower-layer-capacity", DEFAULT_LOWER_SIZE_IN_GIB)
+    logging.info(f"Creating image file at {lower_image} with size {lower_size_in_gib} GiB.")
     with open(lower_image, "wb") as f:
-        fd = f.fileno()
-        os.posix_fallocate(fd, 0, lower_initial_allocation_size_in_gib * 1024 * 1024 * 1024)
+        f.seek(lower_size_in_gib * 1024 * 1024 * 1024 - 1)
+        f.write(b'\x00')
     try:
         logging.info(f"Formatting filesystem on {lower_image}")
-        subprocess.run(['mkfs.xfs', lower_image], check=True)
+        subprocess.run(['mkfs.ext4', lower_image], check=True)
         logging.info("Filesystem formatted successfully.")
         with TempMount(lower_image) as mount_point:
             logging.info("Extracting stage3 to lower image...")
             subprocess.run(sudo(['tar', 'xpf', stage3_tarball, '-C', mount_point]), check=True)
-
-        with open(lower_image, "r+b") as f:
-            # seek to the total size and write a null byte to expand the filesystem
-            f.seek(lower_total_size_in_gib * 1024 * 1024 * 1024 - 1)
-            f.write(b'\x00')
-
-        with TempMount(lower_image) as mount_point:
-            # expand the filesystem after extracting
-            logging.info("Expanding filesystem to total size...")
-            subprocess.run(sudo(['xfs_growfs', mount_point]), check=True)
             logging.info("Extracting portage to lower image...")
             portage_dir = os.path.join(mount_point, "var/db/repos/gentoo")
             subprocess.run(sudo(["mkdir", "-p", portage_dir]), check=True)
@@ -530,6 +516,10 @@ def get_packages_from_genpack_json(package_set_type = "runtime"):
             packages.update(mixin_json[property_name])
 
     packages.update(genpack_json.get(property_name, []))
+
+    if "arch" in genpack_json and arch in genpack_json["arch"]:
+        packages.update(genpack_json["arch"][arch].get(property_name, []))
+
     return list(packages)
 
 def lower():
@@ -601,6 +591,12 @@ def lower():
     } | genpack_json.get("use", {})
     license = genpack_json.get("license", {})
     mask = genpack_json.get("mask", [])
+
+    if "arch" in genpack_json and arch in genpack_json["arch"]:
+        accept_keywords.update(genpack_json["arch"][arch].get("accept_keywords", {}))
+        use.update(genpack_json["arch"][arch].get("use", {}))
+        license.update(genpack_json["arch"][arch].get("license", {}))
+        mask.extend(genpack_json["arch"][arch].get("mask", []))
 
     apply_portage_sets_and_flags(lower_image, 
                                 get_packages_from_genpack_json("runtime"),
