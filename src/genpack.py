@@ -193,7 +193,7 @@ def lower_exec(lower_image, cmdline, env=None):
     ]
     if not independent_binpkgs:
         os.makedirs(binpkgs_dir, exist_ok=True)
-        nspawn_cmdline.append(f"--bind={binpkgs_dir}:/var/cache/binpkgs:rootidmap")
+        nspawn_cmdline.append(f"--bind={binpkgs_dir}:/var/cache/binpkgs{':rootidmap' if os.geteuid() != 0 else ''}")
     if overlay_override is not None:
         if not os.path.isdir(overlay_override):
             raise ValueError("overlay-override must be a directory")
@@ -221,7 +221,7 @@ def upper_exec(lower_image, upper_dir, cmdline, user=None):
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, 
         f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
-        "--bind=%s:/var/cache/download:rootidmap" % os.path.abspath(download_dir),
+        f"--bind={os.path.abspath(download_dir)}:/var/cache/download{':rootidmap' if os.geteuid() != 0 else ''}",
         "--capability=CAP_MKNOD,CAP_NET_ADMIN",
         "-E", f"ARTIFACT={genpack_json["name"]}"]
     if user is not None:
@@ -310,6 +310,7 @@ def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packag
         if accept_keywords is None: accept_keywords = {}
         if use is None: use = {}
         if license is None: license = {}
+        if mask is None: mask = []
         if buildtime_packages is None: buildtime_packages = []
 
         etc_dir = os.path.join(mount_point, "etc")
@@ -361,6 +362,8 @@ def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packag
         else:
             subprocess.run(sudo(['rm', '-f', os.path.join(sets_dir, "genpack-devel")]), check=True)
 
+        if not isinstance(accept_keywords, dict):
+            raise ValueError("accept_keywords must be a dictionary")
         accept_keywords_file = os.path.join(etc_portage_dir, "package.accept_keywords/genpack")
         logging.info(f"Applying accept keywords to {accept_keywords_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(accept_keywords_file)]), check=True)
@@ -377,6 +380,8 @@ def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packag
             tee.stdin.close()
             tee.wait()
 
+        if not isinstance(use, dict):
+            raise ValueError("use must be a dictionary")
         use_file = os.path.join(etc_portage_dir, "package.use/genpack")
         logging.info(f"Applying USE flags to {use_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(use_file)]), check=True)
@@ -393,6 +398,8 @@ def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packag
             tee.stdin.close()
             tee.wait()
 
+        if not isinstance(license, dict):
+            raise ValueError("license must be a dictionary")
         license_file = os.path.join(etc_portage_dir, "package.license/genpack")
         logging.info(f"Applying LICENSE flags to {license_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(license_file)]), check=True)
@@ -409,6 +416,8 @@ def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packag
             tee.stdin.close()
             tee.wait()
 
+        if not isinstance(mask, list):
+            raise ValueError("mask must be a list")
         mask_file = os.path.join(etc_portage_dir, "package.mask/genpack")
         logging.info(f"Applying masked packages to {mask_file}")
         subprocess.run(sudo(['mkdir', '-p', os.path.dirname(mask_file)]), check=True)
@@ -565,8 +574,8 @@ def lower():
             f.write(headers_to_info(portage_headers))
     
     latest_mtime = sync_genpack_overlay(lower_image)
-    logging.info(f"Latest genpack-overlay mtime: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_mtime))}")
-    logging.info(f"lower_files time: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(lower_files))) if os.path.exists(lower_files) else 'N/A'}")
+    logging.debug(f"Latest genpack-overlay mtime: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_mtime))}")
+    logging.debug(f"lower_files time: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(lower_files))) if os.path.exists(lower_files) else 'N/A'}")
 
     if os.path.exists(lower_files) and (stage3_is_new or portage_is_new or os.path.getmtime(lower_files) < latest_mtime):
         logging.info(f"Removing old {lower_files} file due to changes in stage3 or portage.")
