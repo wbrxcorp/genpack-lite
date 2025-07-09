@@ -508,28 +508,6 @@ def load_genpack_json(directory="."):
     #else
     return (json_parser.load(open(json_file, "r")), os.path.getmtime(json_file))
 
-"""
-def get_packages_from_genpack_json(package_set_type = "runtime"):
-    if package_set_type not in ["runtime", "buildtime", "devel"]:
-        raise ValueError("package_set_type must be one of 'runtime', 'buildtime', or 'devel'")
-    property_name = f"{package_set_type}-packages" if package_set_type != "runtime" else "packages"
-    packages = set()
-
-    for mixin_id in mixins:
-        if mixin_id not in mixin_genpack_json: continue
-        #else
-        mixin_json = mixin_genpack_json[mixin_id]
-        if property_name in mixin_json:
-            packages.update(mixin_json[property_name])
-
-    packages.update(genpack_json.get(property_name, []))
-
-    if "arch" in genpack_json and arch in genpack_json["arch"]:
-        packages.update(genpack_json["arch"][arch].get(property_name, []))
-
-    return list(packages)
-"""
-
 def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","devel","packages","buildtime_packages","devel_packages",
                                                            "accept_keywords","use","mask","license","binpkg_excludes","users","groups", 
                                                            "services", "arch","variants", ], variant = None):
@@ -779,8 +757,8 @@ def lower(variant=None, devel=False):
     if "circulardep-breaker" in genpack_json:
         raise ValueError("Use circulardep_breaker instead of circulardep-breaker in genpack.json")
     if "circulardep_breaker" in genpack_json:
-        circulardep_breaker_packages = genpack_json["circulardep-breaker"].get("packages", [])
-        circulardep_breaker_use = genpack_json["circulardep-breaker"].get("use", None)
+        circulardep_breaker_packages = genpack_json["circulardep_breaker"].get("packages", [])
+        circulardep_breaker_use = genpack_json["circulardep_breaker"].get("use", None)
         if len(circulardep_breaker_packages) > 0:
             logging.info("Emerging circular dependency breaker packages...")
             env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
@@ -967,20 +945,16 @@ def upper(variant):
         uid = user.get("uid", None)
         comment = user.get("comment", None)
         home = user.get("home", None)
-        create_home = user.get("create-home", True)
+        create_home = user.get("create_home", user.get("create-home", True))
         shell = user.get("shell", None)
-        if "initial_group" in user:
-            raise Exception("Use 'initial-group' instead of 'initial_group'")
-        initial_group = user.get("initial-group", None)
-        if "additional_groups" in user:
-            raise Exception("Use 'additional-groups' instead of 'additional_groups'")
-        additional_groups = user.get("additional-groups", [])
+        initial_group = user.get("initial_group", user.get("initial-group", "users"))
+        additional_groups = user.get("additional_groups", user.get("additional-groups", []))
         if isinstance(additional_groups, str):
             additional_groups = [additional_groups]
         elif not isinstance(additional_groups, list):
             raise Exception("additional-groups must be list or string")
         if "shell" in user: shell = user["shell"]
-        empty_password = user.get("empty-password", False)
+        empty_password = user.get("empty_password", user.get("empty-password", False))
         useradd_cmd = ["useradd"]
         if uid is not None: useradd_cmd += ["-u", str(uid)]
         if comment is not None: useradd_cmd += ["-c", comment]
