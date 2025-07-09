@@ -6,7 +6,7 @@ from datetime import datetime
 import json5 # dev-python/json5
 import requests # dev-python/requests
 
-DEFAULT_LOWER_SIZE_IN_GIB = 20  # Default total size for lower image in GiB
+DEFAULT_LOWER_SIZE_IN_GIB = 24  # Default max size of lower image in GiB
 OVERLAY_SOURCE = "https://github.com/wbrxcorp/genpack-overlay.git"
 
 arch = os.uname().machine
