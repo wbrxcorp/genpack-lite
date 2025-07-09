@@ -13,9 +13,6 @@ arch = os.uname().machine
 
 work_root = "work"
 work_dir = os.path.join(work_root, arch)
-lower_image = os.path.join(work_dir, "lower.img")
-lower_files = os.path.join(work_dir, "lower.files")
-upper_dir = os.path.join(work_dir, "upper")
 
 cache_root = os.path.join(os.path.expanduser("~"), ".cache/genpack")
 cache_arch_dir = os.path.join(cache_root, arch)
@@ -26,14 +23,19 @@ base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
 overlay_override = None
 independent_binpkgs = False
-compression = None
-devel = False
 genpack_json = None
 genpack_json_time = None
 
 mixin_root = os.path.join(work_root, "mixins")
 mixins = []
 mixin_genpack_json = {}
+
+class Variant:
+    def __init__(self, name):
+        self.name = name
+        self.lower_image = os.path.join(work_dir, "lower.img") if self.name is None else os.path.join(work_dir, "lower-%s.img" % self.name)
+        self.lower_files = os.path.join(work_dir, "lower.files") if self.name is None else os.path.join(work_dir, "lower-%s.files" % self.name)
+        self.upper_dir = os.path.join(work_dir, "upper") if self.name is None else os.path.join(work_dir, "upper-%s" % self.name)
 
 def sudo(cmd):
     # if current user is root, just return the command
@@ -52,7 +54,7 @@ def url_readlines(url):
     logging.debug(f"Read {len(lines)} lines from {url}")
     return lines
 
-def get_latest_stage3_tarball_url(variant = "systemd"):
+def get_latest_stage3_tarball_url(stage3_variant = "systemd"):
     _arch = arch
     _arch2 = arch
     if _arch == "x86_64": _arch = _arch2 = "amd64"
@@ -62,7 +64,7 @@ def get_latest_stage3_tarball_url(variant = "systemd"):
         _arch = "riscv"
         _arch2 = "rv64_lp64d"
     current_status = None
-    for line in url_readlines(base_url + "releases/" + _arch + "/autobuilds/latest-stage3-" + _arch2 + "-%s.txt" % (variant,)):
+    for line in url_readlines(base_url + "releases/" + _arch + "/autobuilds/latest-stage3-" + _arch2 + "-%s.txt" % (stage3_variant,)):
         if current_status is None:
             if line == "-----BEGIN PGP SIGNED MESSAGE-----": current_status = "header"
             continue
@@ -79,7 +81,7 @@ def get_latest_stage3_tarball_url(variant = "systemd"):
             #else
             return base_url + "releases/" + _arch + "/autobuilds/" + splitted[0]
     #else
-    raise Exception("No stage3 tarball (arch=%s,variant=%s) found", arch, variant)
+    raise Exception("No stage3 tarball (arch=%s,stage3_variant=%s) found", arch, stage3_variant)
 
 def get_latest_portage_tarball_url():
     return base_url + "snapshots/portage-latest.tar.xz"
@@ -199,17 +201,21 @@ def escape_colon(s):
     # systemd-nspawn's some options need colon to be escaped
     return re.sub(r':', r'\:', s)
 
-def upper_exec(lower_image, upper_dir, cmdline, user=None):
+def upper_exec(variant, cmdline, user=None):
     # convert command to list if it is string
     if isinstance(cmdline, str): cmdline = [cmdline]
     container_name = "genpack-%d" % os.getpid()
     os.makedirs(download_dir, exist_ok=True)
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, 
-        f"--image={lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
+        f"--image={variant.lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(variant.upper_dir)),
         f"--bind={os.path.abspath(download_dir)}:/var/cache/download{':rootidmap' if os.geteuid() != 0 else ''}",
         "--capability=CAP_MKNOD,CAP_NET_ADMIN",
-        "-E", f"ARTIFACT={genpack_json["name"]}"]
+        "-E", f"ARTIFACT={genpack_json["name"]}"
+    ]
+    if variant.name is not None:
+        nspawn_cmdline += [f"-E", f"VARIANT={variant.name}"]
+
     if user is not None:
         if not isinstance(user, str):
             raise ValueError("user must be a string")
@@ -219,7 +225,7 @@ def upper_exec(lower_image, upper_dir, cmdline, user=None):
 
 def download_mixins():
     global mixins, mixin_genpack_json
-    mixins_tmp = genpack_json.get("mix-in", None)
+    mixins_tmp = genpack_json.get("mixin", None)
     if mixins_tmp is None:
         return
     #else
@@ -502,12 +508,13 @@ def load_genpack_json(directory="."):
     #else
     return (json_parser.load(open(json_file, "r")), os.path.getmtime(json_file))
 
+"""
 def get_packages_from_genpack_json(package_set_type = "runtime"):
-    """Get packages from genpack.json."""
     if package_set_type not in ["runtime", "buildtime", "devel"]:
         raise ValueError("package_set_type must be one of 'runtime', 'buildtime', or 'devel'")
     property_name = f"{package_set_type}-packages" if package_set_type != "runtime" else "packages"
     packages = set()
+
     for mixin_id in mixins:
         if mixin_id not in mixin_genpack_json: continue
         #else
@@ -521,8 +528,152 @@ def get_packages_from_genpack_json(package_set_type = "runtime"):
         packages.update(genpack_json["arch"][arch].get(property_name, []))
 
     return list(packages)
+"""
 
-def lower():
+def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","devel","packages","buildtime_packages","devel_packages",
+                                                           "accept_keywords","use","mask","license","binpkg_excludes","users","groups", 
+                                                           "services", "arch","variants", ], variant = None):
+    if not isinstance(trunk, dict):
+        raise ValueError("trunk must be a dictionary")
+    #else
+    path_str = " > ".join(path)
+    if not isinstance(branch, dict):
+        raise ValueError(f"branch at {path_str} must be a dictionary")
+
+    if "outfile" in allowed_properties and "outfile" in branch:
+        trunk["outfile"] = branch["outfile"]
+    
+    if "devel" in allowed_properties and "devel" in branch:
+        if not isinstance(branch["devel"], bool):
+            raise ValueError(f"devel at {path_str} must be a boolean")
+        #else
+        trunk["devel"] = branch["devel"]
+
+    if "packages" in allowed_properties and "packages" in branch:
+        if not isinstance(branch["packages"], list):
+            raise ValueError(f"packages at {path_str} must be a list")
+        #else
+        if "packages" not in trunk: trunk["packages"] = []
+        for package in branch["packages"]:
+            if package not in trunk["packages"]:
+                trunk["packages"].append(package)
+
+    if "buildtime_packages" in allowed_properties:
+        if "buildtime-packages" in branch:
+            raise ValueError(f"buildtime-packages at {path_str} is deprecated, use buildtime_packages instead")
+        if "buildtime_packages" in branch:
+            if not isinstance(branch["buildtime_packages"], list):
+                raise ValueError(f"buildtime_packages at {path_str} must be a list")
+            #else
+            if "buildtime_packages" not in trunk: trunk["buildtime_packages"] = []
+            for package in branch["buildtime_packages"]:
+                if package not in trunk["buildtime_packages"]:
+                    trunk["buildtime_packages"].append(package)
+
+    if "devel_packages" in allowed_properties:
+        if "devel-packages" in branch:
+            raise ValueError(f"devel-packages at {path_str} is deprecated, use devel_packages instead")
+        if "devel_packages" in branch:
+            if not isinstance(branch["devel_packages"], list):
+                raise ValueError(f"devel_packages at {path_str} must be a list")
+            #else
+            if "devel_packages" not in trunk: trunk["devel_packages"] = []
+            for package in branch["devel_packages"]:
+                if package not in trunk["devel_packages"]:
+                    trunk["devel_packages"].append(package)
+    
+    if "accept_keywords" in allowed_properties and "accept_keywords" in branch:
+        if not isinstance(branch["accept_keywords"], dict):
+            raise ValueError(f"accept_keywords at {path_str} must be a dictionary")
+        #else
+        if "accept_keywords" not in trunk: trunk["accept_keywords"] = {}
+        for k, v in branch["accept_keywords"].items():
+            trunk["accept_keywords"][k] = v
+
+    if "use" in allowed_properties and "use" in branch:
+        if not isinstance(branch["use"], dict):
+            raise ValueError(f"use at {path_str} must be a dictionary")
+        #else
+        if "use" not in trunk: trunk["use"] = {}
+        for k, v in branch["use"].items():
+            trunk["use"][k] = v # TODO: merge if already exists
+    
+    if "mask" in allowed_properties and "mask" in branch:
+        if not isinstance(branch["mask"], list):
+            raise ValueError(f"mask at {path_str} must be a list")
+        #else
+        if "mask" not in trunk: trunk["mask"] = []
+        for package in branch["mask"]:
+            if package not in trunk["mask"]:
+                trunk["mask"].append(package)
+
+    if "license" in allowed_properties and "license" in branch:
+        if not isinstance(branch["license"], dict):
+            raise ValueError(f"license at {path_str} must be a dictionary")
+        #else
+        if "license" not in trunk: trunk["license"] = {}
+        for k, v in branch["license"].items():
+            trunk["license"][k] = v
+    
+    if "binpkg_excludes" in allowed_properties:
+        if "binpkg-exclude" in branch:
+            raise ValueError(f"binpkg-exclude at {path_str} is deprecated, use binpkg_excludes instead")
+        if "binpkg_excludes" in branch:
+            if not isinstance(branch["binpkg_excludes"], (str, list)):
+                raise ValueError(f"binpkg_excludes at {path_str} must be a string or a list of strings")
+            #else
+            if "binpkg_excludes" not in trunk: trunk["binpkg_excludes"] = []
+            if isinstance(branch["binpkg_excludes"], str):
+                branch["binpkg_excludes"] = [branch["binpkg_excludes"]]
+            for package in branch["binpkg_excludes"]:
+                if package not in trunk["binpkg_excludes"]:
+                    trunk["binpkg_excludes"].append(package)
+
+    if "users" in allowed_properties and "users" in branch:
+        if not isinstance(branch["users"], list):
+            raise ValueError(f"users at {path_str} must be a list")
+        #else
+        if "users" not in trunk: trunk["users"] = []
+        trunk["users"] += branch["users"]
+
+    if "groups" in allowed_properties and "groups" in branch:
+        if not isinstance(branch["groups"], list):
+            raise ValueError(f"groups at {path_str} must be a list")
+        #else
+        if "groups" not in trunk: trunk["groups"] = []
+        trunk["groups"] += branch["groups"]
+    
+    if "services" in allowed_properties and "services" in branch:
+        if not isinstance(branch["services"], list):
+            raise ValueError(f"services at {path_str} must be a list")
+        #else
+        if "services" not in trunk: trunk["services"] = []
+        for service in branch["services"]:
+            if service not in trunk["services"]:
+                trunk["services"].append(service)
+    
+    if "arch" in allowed_properties and "arch" in branch:
+        if not isinstance(branch["arch"], dict):
+            raise ValueError(f"arch at {path_str} must be a dictionary")
+        #else
+        if arch in branch["arch"]:
+            merge_genpack_json(trunk, branch["arch"][arch], path + [f"arch={arch}"], [
+                "packages","buildtime_packages","devel_packages",
+                "accept_keywords","use","mask","license","binpkg_exclude"
+            ])
+    
+    if "variants" in allowed_properties and "variants" in branch and variant is not None:
+        if not isinstance(branch["variants"], dict):    
+            raise ValueError(f"variants at {path_str} must be a dictionary")
+        #else
+        if isinstance(variant, Variant): variant = variant.name
+        if variant in branch["variants"]:
+            merge_genpack_json(trunk, branch["variants"][variant], path + [f"variant={variant}"], [
+                "name","outfile","packages","buildtime_packages","devel_packages",
+                "accept_keywords","use","mask","license","binpkg_exclude","users","groups","arch"
+            ])
+
+def lower(variant=None, devel=False):
     logging.info("Processing lower layer...")
     os.makedirs(work_dir, exist_ok=True)
     # todo: create .gitignore in work_root
@@ -551,61 +702,74 @@ def lower():
         portage_is_new = True
 
     image_is_new = False
-    if stage3_is_new or not os.path.isfile(lower_image):
-        setup_lower_image(lower_image, stage3_tarball, portage_tarball)
+    if stage3_is_new or not os.path.isfile(variant.lower_image):
+        setup_lower_image(variant.lower_image, stage3_tarball, portage_tarball)
         image_is_new = True
         with open(stage3_saved_headers_path, 'w') as f:
             f.write(headers_to_info(stage3_headers))
     elif portage_is_new:
-        replace_portage(lower_image, portage_tarball)
+        replace_portage(variant.lower_image, portage_tarball)
 
     if portage_is_new:
         with open(portage_saved_headers_path, 'w') as f:
             f.write(headers_to_info(portage_headers))
     
-    latest_mtime = sync_genpack_overlay(lower_image)
+    latest_mtime = sync_genpack_overlay(variant.lower_image)
     logging.debug(f"Latest genpack-overlay mtime: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_mtime))}")
-    logging.debug(f"lower_files time: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(lower_files))) if os.path.exists(lower_files) else 'N/A'}")
+    logging.debug(f"lower_files time: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(variant.lower_files))) if os.path.exists(variant.lower_files) else 'N/A'}")
 
-    if os.path.exists(lower_files) and (stage3_is_new or portage_is_new or os.path.getmtime(lower_files) < latest_mtime):
-        logging.info(f"Removing old {lower_files} file due to changes in stage3 or portage.")
-        os.remove(lower_files)
+    if os.path.exists(variant.lower_files) and (stage3_is_new or portage_is_new or os.path.getmtime(variant.lower_files) < latest_mtime):
+        logging.info(f"Removing old {variant.lower_files} file due to changes in stage3 or portage.")
+        os.remove(variant.lower_files)
 
-    if os.path.exists(lower_files):
+    if os.path.exists(variant.lower_files):
         logging.info("Lower image is up-to-date, skipping.")
         return
 
-    gentoo_profile = genpack_json.get("gentoo-profile", None)
+    gentoo_profile = genpack_json.get("gentoo_profile", None)
     if gentoo_profile is not None and image_is_new:
-        set_gentoo_profile(lower_image, gentoo_profile)
+        set_gentoo_profile(variant.lower_image, gentoo_profile)
     
-    accept_keywords = {
-        "dev-cpp/argparse":None # argparse is required for genpack-progs
-    } | genpack_json.get("accept_keywords", {})
-    use = {
-        "sys-libs/glibc": "audit", # Intentionally causing glibc to be rebuilt
-        "sys-kernel/installkernel":"dracut", # genpack depends on dracut
-        "app-crypt/libb2":"-openmp", # openmp support brings gcc dependency, which is not generally needed for genpack
-        "dev-lang/perl":"minimal",
-        "app-editors/vim":"minimal"
-    } | genpack_json.get("use", {})
-    license = genpack_json.get("license", {})
-    mask = genpack_json.get("mask", [])
+    merged_genpack_json = {
+        "accept_keywords": {
+            "dev-cpp/argparse":None # argparse is required for genpack-progs
+        },
+        "use": {
+            "sys-libs/glibc": "audit", # Intentionally causing glibc to be rebuilt
+            "sys-kernel/installkernel":"dracut", # genpack depends on dracut
+            "app-crypt/libb2":"-openmp", # openmp support brings gcc dependency, which is not generally needed for genpack
+            "dev-lang/perl":"minimal",
+            "app-editors/vim":"minimal"
+        }
+    }
 
-    if "arch" in genpack_json and arch in genpack_json["arch"]:
-        accept_keywords.update(genpack_json["arch"][arch].get("accept_keywords", {}))
-        use.update(genpack_json["arch"][arch].get("use", {}))
-        license.update(genpack_json["arch"][arch].get("license", {}))
-        mask.extend(genpack_json["arch"][arch].get("mask", []))
+    # merge mixins
+    for mixin_id in mixins:
+        if mixin_id in mixin_genpack_json:
+            merge_genpack_json(merged_genpack_json, mixin_genpack_json[mixin_id], [f"mixin({mixin_id})"], [
+                "packages","buildtime_packages","devel_packages","accept_keywords","use","mask",
+                "license","binpkg_excludes","users","groups", "arch"
+            ])
 
-    apply_portage_sets_and_flags(lower_image, 
-                                get_packages_from_genpack_json("runtime"),
-                                get_packages_from_genpack_json("buildtime"),
-                                get_packages_from_genpack_json("devel") if devel else None,
-                                accept_keywords, use, license, mask)
+    # merge main genpack.json
+    merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], 
+        ["devel","packages","buildtime_packages","devel_packages",
+            "accept_keywords","use","mask","license","binpkg_excludes",
+            "arch","variants"], variant)
+
+    devel = devel or merged_genpack_json.get("devel", False)
+
+    apply_portage_sets_and_flags(variant.lower_image, 
+                                merged_genpack_json.get("packages", []),
+                                merged_genpack_json.get("buildtime_packages", []),
+                                merged_genpack_json.get("devel_packages", []) if devel else None,
+                                merged_genpack_json.get("accept_keywords", {}),
+                                merged_genpack_json.get("use", {}), 
+                                merged_genpack_json.get("license", {}), 
+                                merged_genpack_json.get("mask", []))
 
     # binpkg_exclude
-    binpkg_exclude = genpack_json.get("binpkg-exclude", [])
+    binpkg_exclude = merged_genpack_json.get("binpkg_exclude", [])
     if isinstance(binpkg_exclude, str):
         binpkg_exclude = [binpkg_exclude]
     elif not isinstance(binpkg_exclude, list):
@@ -613,6 +777,8 @@ def lower():
 
     # circular dependency breaker
     if "circulardep-breaker" in genpack_json:
+        raise ValueError("Use circulardep_breaker instead of circulardep-breaker in genpack.json")
+    if "circulardep_breaker" in genpack_json:
         circulardep_breaker_packages = genpack_json["circulardep-breaker"].get("packages", [])
         circulardep_breaker_use = genpack_json["circulardep-breaker"].get("use", None)
         if len(circulardep_breaker_packages) > 0:
@@ -623,7 +789,7 @@ def lower():
                 emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
                 emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
             emerge_cmd += circulardep_breaker_packages
-            lower_exec(lower_image, emerge_cmd, env)
+            lower_exec(variant.lower_image, emerge_cmd, env)
 
     logging.info("Emerging all packages...")
     emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going"]
@@ -633,7 +799,7 @@ def lower():
     emerge_cmd += ["@world", "genpack-progs", "@genpack-runtime", "@genpack-buildtime"]
     if devel:
         emerge_cmd += ["@genpack-devel"]
-    lower_exec(lower_image, emerge_cmd)
+    lower_exec(variant.lower_image, emerge_cmd)
 
     logging.info("Rebuilding preserved packages...")
     emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y"]
@@ -641,7 +807,7 @@ def lower():
         emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
         emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
     emerge_cmd += ["@preserved-rebuild"]
-    lower_exec(lower_image, emerge_cmd)
+    lower_exec(variant.lower_image, emerge_cmd)
 
     logging.info("Cleaning up...")
     cleanup_cmd = "emerge --depclean"
@@ -650,10 +816,10 @@ def lower():
     cleanup_cmd += " && eclean-pkg"
     if independent_binpkgs:
         cleanup_cmd += " -d" # with independent binpkgs, we can clean up binpkgs more aggressively
-    lower_exec(lower_image, ["sh", "-c", cleanup_cmd])
+    lower_exec(variant.lower_image, ["sh", "-c", cleanup_cmd])
 
     files = []
-    with TempMount(lower_image) as mount_point:
+    with TempMount(variant.lower_image) as mount_point:
         list_pkg_files = subprocess.Popen(
             sudo(["chroot", mount_point, "list-pkg-files"]), 
             stdout=subprocess.PIPE,
@@ -672,19 +838,19 @@ def lower():
             return_code = list_pkg_files.wait()
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, list_pkg_files.args)
-    
-    with open(lower_files, "w") as f:
+
+    with open(variant.lower_files, "w") as f:
         for file in ["bin", "sbin", "lib", "lib64", "usr/sbin", "run", "proc", "sys", "root", "home", "tmp", "mnt",
                      "dev", "dev/console", "dev/null"]:
             files.append(file)
         for file in sorted(files):
             f.write(file + '\n')
 
-def bash():
+def bash(variant):
     logging.info("Running bash in the lower image for debugging.")
-    lower_exec(lower_image, "bash")
+    lower_exec(variant.lower_image, "bash")
 
-def copy_upper_files():
+def copy_upper_files(upper_dir):
     if not os.path.isdir(upper_dir):
         raise FileNotFoundError(f"Upper directory {upper_dir} does not exist.")
     # copy mixin files
@@ -703,17 +869,17 @@ def copy_upper_files():
     else:
         logging.info("No 'files' directory found, skipping file copy.")
 
-def upper():
+def upper(variant):
     logging.info("Processing upper layer...")
-    if not os.path.isfile(lower_image) or not os.path.exists(lower_files):
-        raise FileNotFoundError(f"Lower image {lower_image} or lower files {lower_files} does not exist. Please run 'genpack lower' first.")
+    if not os.path.isfile(variant.lower_image) or not os.path.exists(variant.lower_files):
+        raise FileNotFoundError(f"Lower image {variant.lower_image} or lower files {variant.lower_files} does not exist. Please run 'genpack lower' first.")
 
-    subprocess.run(sudo(['mkdir', '-p', upper_dir]), check=True)
+    subprocess.run(sudo(['mkdir', '-p', variant.upper_dir]), check=True)
 
     # reset upper dir by deleting files not listed in lower_files
     logging.info("Deleting upper files not listed in lower files...")
     files_to_preserve = set()
-    with open(lower_files, "r") as f:
+    with open(variant.lower_files, "r") as f:
         for line in f:
             line = line.rstrip('\n')
             if not line or line.startswith('#'): continue
@@ -725,7 +891,7 @@ def upper():
                 dirname = os.path.dirname(dirname)
 
     files_to_remove = set()
-    find = subprocess.Popen(sudo(["find", upper_dir, "-printf", "%P\\n"]), stdout=subprocess.PIPE, text=True, bufsize=1)
+    find = subprocess.Popen(sudo(["find", variant.upper_dir, "-printf", "%P\\n"]), stdout=subprocess.PIPE, text=True, bufsize=1)
     try:
         for line in find.stdout:
             line = line.rstrip('\n')
@@ -750,18 +916,28 @@ def upper():
             yield lst[i : i + n]
 
     for chunk in chunk_generator(list(files_to_remove), 64):
-        subprocess.run(sudo(["rm", "-rf"] + chunk), check=True, cwd=upper_dir)
-        #subprocess.run(sudo(["pwd"]), check=True, cwd=upper_dir)
+        subprocess.run(sudo(["rm", "-rf"] + chunk), check=True, cwd=variant.upper_dir)
 
     # copy-up from lower to upper
     logging.info("Copying files from lower image to upper directory...")
-    with TempMount(lower_image) as mount_point:
-        subprocess.run(sudo(["rsync", "-a", f"--files-from={lower_files}", "--relative", mount_point + "/", upper_dir]), check=True)
-    
-    upper_exec(lower_image, upper_dir, ["exec-package-scripts-and-generate-metadata"])
+    with TempMount(variant.lower_image) as mount_point:
+        subprocess.run(sudo(["rsync", "-a", f"--files-from={variant.lower_files}", "--relative", mount_point + "/", variant.upper_dir]), check=True)
+
+    upper_exec(variant, ["exec-package-scripts-and-generate-metadata"])
+
+    # merge genpack.json
+    merged_genpack_json = {}
+    for mixin_id in mixins:
+        mixin_genpack_json = mixin_genpack_json.get(mixin_id, {})
+        merge_genpack_json(merged_genpack_json, mixin_genpack_json, [f"mixin({mixin_id})", "genpack.json"], [
+            "users","groups", "services", "arch"
+        ])
+    merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], [
+        "users","groups", "services", "arch"
+    ])
 
     # create groups
-    groups = genpack_json.get("groups", [])
+    groups = merged_genpack_json.get("groups", [])
     for group in groups:
         name = group if isinstance(group, str) else None
         gid = None
@@ -776,10 +952,10 @@ def upper():
         if gid is not None: groupadd_cmd += ["-g", str(gid)]
         groupadd_cmd.append(name)
         logging.info("Creating group %s..." % name)
-        upper_exec(lower_image, upper_dir, groupadd_cmd)
+        upper_exec(variant, groupadd_cmd)
 
     # create users
-    users = genpack_json.get("users", [])
+    users = merged_genpack_json.get("users", [])
     for user in users:
         name = user if isinstance(user, str) else None
         if name is None:
@@ -817,16 +993,16 @@ def upper():
         if empty_password: useradd_cmd += ["-p", ""]
         useradd_cmd.append(name)
         logging.info("Creating user %s..." % name)
-        upper_exec(lower_image, upper_dir, useradd_cmd)
+        upper_exec(variant, useradd_cmd)
 
-    copy_upper_files()
+    copy_upper_files(variant.upper_dir)
 
     # execute build sctript if exists
-    build_script = os.path.join(upper_dir, "build")
+    build_script = os.path.join(variant.upper_dir, "build")
     if os.path.isfile(build_script):
         logging.info(f"Executing build script: /build")
-        upper_exec(lower_image, upper_dir, ["/build"])
-    build_script_d = os.path.join(upper_dir, "build.d")
+        upper_exec(variant, ["/build"])
+    build_script_d = os.path.join(variant.upper_dir, "build.d")
     if os.path.isdir(build_script_d):
         # os.listdir returns filenames in arbitrary order, usually ASCII order on most filesystems,
         # but it is not guaranteed by Python. If you want ASCII order, sort explicitly:
@@ -845,7 +1021,7 @@ def upper():
                 interpreter = determine_interpreter(script_path)
                 logging.info(f"Executing build script: /build.d/{script}")
                 script_to_run_in_container = os.path.join("/build.d", script)
-                upper_exec(lower_image, upper_dir, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container])
+                upper_exec(variant, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container])
             elif os.path.isdir(script_path):
                 user_subdirs.append(script)
                 logging.info(f"Found user subdirectory in build.d: {script_path}")
@@ -861,30 +1037,32 @@ def upper():
                 logging.info(f"Executing build script in user subdirectory: /build.d/{subdir}/{script} as user {subdir}")
                 interpreter = determine_interpreter(script_path)
                 script_to_run_in_container = os.path.join("/build.d", subdir, script)
-                upper_exec(lower_image, upper_dir, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container], user=subdir)
+                upper_exec(variant, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container], user=subdir)
 
     # enable services
-    services = genpack_json.get("services", [])
+    services = merged_genpack_json.get("services", [])
     if len(services) > 0:
-        upper_exec(lower_image, upper_dir, ["systemctl", "enable"] + services)
+        upper_exec(variant, ["systemctl", "enable"] + services)
 
-def upper_bash():
-    if not os.path.isdir(upper_dir):
-        raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
-    copy_upper_files()    
+def upper_bash(variant):
+    if not os.path.isdir(variant.upper_dir):
+        raise FileNotFoundError(f"Upper directory {variant.upper_dir} does not exist. Please run 'upper' first")
+    copy_upper_files(variant.upper_dir)
     logging.info("Running bash in the upper directory for debugging.")
-    upper_exec(lower_image, upper_dir, "bash")
+    upper_exec(variant, ["bash"])
 
-def pack():
-    global compression
-    if not os.path.isfile(lower_image):
-        raise FileNotFoundError(f"Lower image {lower_image} does not exist. Please run 'lower' first")
-    if not os.path.isdir(upper_dir):
-        raise FileNotFoundError(f"Upper directory {upper_dir} does not exist. Please run 'upper' first")
+def pack(variant, compression=None):
+    if not os.path.isfile(variant.lower_files):
+        raise FileNotFoundError(f"Lower files {variant.lower_files} does not exist. Please run 'lower' first.")
+    if not os.path.isdir(variant.upper_dir):
+        raise FileNotFoundError(f"Upper directory {variant.upper_dir} does not exist. Please run 'upper' first")
     #else
 
-    name = genpack_json["name"]
-    outfile = genpack_json.get("outfile", f"{name}-{arch}.squashfs")
+    merged_genpack_json = {}
+    merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], ["outfile","variants"])
+
+    name = variant.name or genpack_json["name"]
+    outfile = merged_genpack_json.get("outfile", f"{name}-{arch}.squashfs")
 
     if compression is None:
         compression = genpack_json.get("compression", "gzip")
@@ -901,7 +1079,7 @@ def pack():
     else:
         raise ValueError(f"Unknown compression type: {compression}")
 
-    cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
+    cmdline = ["mksquashfs", variant.upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
     cmdline += compression_opts
     cmdline += ["-e", "build", "build.d", "build.d/*", "var/log/*.log", "var/tmp/*"]
 
@@ -936,6 +1114,7 @@ if __name__ == "__main__":
     parser.add_argument("--independent-binpkgs", action="store_true", help="Use independent binpkgs, do not use shared one")
     parser.add_argument("--compression", choices=["gzip", "xz", "lzo", "none"], default=None, help="Compression type for the final SquashFS image")
     parser.add_argument("--devel", action="store_true", help="Generate development image, if supported by genpack.json")
+    parser.add_argument("--variant", default=None, help="Variant to use from genpack.json, if supported")
     parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "upper-clean", "pack"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
@@ -965,43 +1144,35 @@ if __name__ == "__main__":
     
     overlay_override = args.overlay_override
 
-    if args.devel:
-        devel = True
-    else:
-        devel = genpack_json.get("devel", False)
-
-    if args.independent_binpkgs:
-        independent_binpkgs = True
-    else:
-        independent_binpkgs = genpack_json.get("independent-binpkgs", False)
-
-    compression = args.compression
+    independent_binpkgs = args.independent_binpkgs or genpack_json.get("independent_binpkgs", False)
+    variant = Variant(args.variant or genpack_json.get("default_variant", None))
+    if variant.name is not None:
+        available_variants = genpack_json.get("variants", {})
+        if variant.name not in available_variants:
+            raise ValueError(f"Variant '{variant.name}' is not available in genpack.json. Available variants: {list(available_variants.keys())}")
 
     download_mixins()
 
     if args.action == "bash":
-        bash()
+        bash(variant)
         exit(0)
     elif args.action == "upper-bash":
-        upper_bash()
+        upper_bash(variant)
         exit(0)
     elif args.action == "upper-clean":
-        if os.path.isdir(upper_dir):
-            logging.info(f"Removing upper directory: {upper_dir}")
-            subprocess.run(sudo(['rm', '-rf', upper_dir]), check=True)
-        exit(0)
+        raise ValueError("upper-clean is not implemented yet, use 'upper' and then remove upper directory manually.")
     #else
 
     if args.action in ["build", "lower"]:
-        if os.path.exists(lower_files):
+        if os.path.exists(variant.lower_files):
             latest_mtime = get_latest_mtime(genpack_json_time, "savedconfig", "patches", "kernel", mixin_root)
-            if os.path.getmtime(lower_files) < latest_mtime:
-                logging.info(f"Lower files {lower_files} is outdated, rebuilding lower layer.")
-                os.remove(lower_files)
+            if os.path.getmtime(variant.lower_files) < latest_mtime:
+                logging.info(f"Lower files {variant.lower_files} is outdated, rebuilding lower layer.")
+                os.remove(variant.lower_files)
             elif args.action == "lower":
-                os.remove(lower_files)
-        lower()
+                os.remove(variant.lower_files)
+        lower(variant, args.devel)
     if args.action in ["build", "upper"]:
-        upper()
+        upper(variant)
     if args.action in ["build", "pack"]:
-        pack()
+        pack(variant, args.compression)
