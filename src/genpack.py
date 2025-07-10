@@ -177,6 +177,7 @@ def lower_exec(lower_image, cmdline, env=None):
     container_name = "genpack-%d" % os.getpid()
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, f"--image={lower_image}",
+        "--tmpfs=/var/tmp",
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN,CAP_NET_ADMIN", # Portage's network sandbox needs CAP_NET_ADMIN
     ]
     if not independent_binpkgs:
@@ -533,7 +534,11 @@ def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","dev
         #else
         if "packages" not in trunk: trunk["packages"] = []
         for package in branch["packages"]:
-            if package not in trunk["packages"]:
+            if package[0] == '-':
+                package = package[1:]
+                if package in trunk["packages"]:
+                    trunk["packages"].remove(package)
+            elif package not in trunk["packages"]:
                 trunk["packages"].append(package)
 
     if "buildtime_packages" in allowed_properties:
