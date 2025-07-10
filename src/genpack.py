@@ -634,11 +634,14 @@ def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","dev
         if not isinstance(branch["arch"], dict):
             raise ValueError(f"arch at {path_str} must be a dictionary")
         #else
-        if arch in branch["arch"]:
-            merge_genpack_json(trunk, branch["arch"][arch], path + [f"arch={arch}"], [
-                "packages","buildtime_packages","devel_packages",
-                "accept_keywords","use","mask","license","binpkg_exclude"
-            ])
+        for k, v in branch["arch"].items():
+            if not isinstance(k, str):
+                raise ValueError(f"arch at {path_str} must be a string")
+            if arch in k.split('|'):
+                merge_genpack_json(trunk, v, path + [f"arch={k}"], [
+                    "packages","buildtime_packages","devel_packages",
+                    "accept_keywords","use","mask","license","binpkg_exclude","services"
+                ])
     
     if "variants" in allowed_properties and "variants" in branch and variant is not None:
         if not isinstance(branch["variants"], dict):    
@@ -648,7 +651,8 @@ def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","dev
         if variant in branch["variants"]:
             merge_genpack_json(trunk, branch["variants"][variant], path + [f"variant={variant}"], [
                 "name","outfile","packages","buildtime_packages","devel_packages",
-                "accept_keywords","use","mask","license","binpkg_exclude","users","groups","arch"
+                "accept_keywords","use","mask","license","binpkg_exclude","users","groups",
+                "services","arch"
             ])
 
 def lower(variant=None, devel=False):
@@ -797,7 +801,10 @@ def lower(variant=None, devel=False):
     lower_exec(variant.lower_image, ["sh", "-c", cleanup_cmd])
 
     files = []
+    lib64_exists = None
     with TempMount(variant.lower_image) as mount_point:
+        # check if lib64 exists
+        lib64_exists = os.path.exists(os.path.join(mount_point, "lib64"))
         list_pkg_files = subprocess.Popen(
             sudo(["chroot", mount_point, "list-pkg-files"]), 
             stdout=subprocess.PIPE,
@@ -818,9 +825,11 @@ def lower(variant=None, devel=False):
                 raise subprocess.CalledProcessError(return_code, list_pkg_files.args)
 
     with open(variant.lower_files, "w") as f:
-        for file in ["bin", "sbin", "lib", "lib64", "usr/sbin", "run", "proc", "sys", "root", "home", "tmp", "mnt",
+        for file in ["bin", "sbin", "lib", "usr/sbin", "run", "proc", "sys", "root", "home", "tmp", "mnt",
                      "dev", "dev/console", "dev/null"]:
             files.append(file)
+        if lib64_exists:
+            files.append("lib64")
         for file in sorted(files):
             f.write(file + '\n')
 
