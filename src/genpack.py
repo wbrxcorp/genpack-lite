@@ -7,6 +7,7 @@ import json5 # dev-python/json5
 import requests # dev-python/requests
 
 DEFAULT_LOWER_SIZE_IN_GIB = 24  # Default max size of lower image in GiB
+DEFAULT_UPPER_SIZE_IN_GIB = 8  # Default max size of upper image in GiB
 OVERLAY_SOURCE = "https://github.com/wbrxcorp/genpack-overlay.git"
 
 arch = os.uname().machine
@@ -36,7 +37,7 @@ class Variant:
         self.name = name
         self.lower_image = os.path.join(work_dir, "lower.img") if self.name is None else os.path.join(work_dir, "lower-%s.img" % self.name)
         self.lower_files = os.path.join(work_dir, "lower.files") if self.name is None else os.path.join(work_dir, "lower-%s.files" % self.name)
-        self.upper_dir = os.path.join(work_dir, "upper") if self.name is None else os.path.join(work_dir, "upper-%s" % self.name)
+        self.upper_image = os.path.join(work_dir, "upper.img") if self.name is None else os.path.join(work_dir, "upper-%s.img" % self.name)
 
 def sudo(cmd):
     # if current user is root, just return the command
@@ -210,14 +211,15 @@ def escape_colon(s):
     # systemd-nspawn's some options need colon to be escaped
     return re.sub(r':', r'\:', s)
 
-def upper_exec(variant, cmdline, user=None):
+def upper_exec(upper_dir, variant, cmdline, user=None):
     # convert command to list if it is string
     if isinstance(cmdline, str): cmdline = [cmdline]
     container_name = "genpack-%d" % os.getpid()
     os.makedirs(download_dir, exist_ok=True)
+
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, 
-        f"--image={variant.lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(variant.upper_dir)),
+        f"--image={variant.lower_image}", "--overlay=+/:%s:/" % escape_colon(os.path.abspath(upper_dir)),
         f"--bind={os.path.abspath(download_dir)}:/var/cache/download{':rootidmap' if os.geteuid() != 0 else ''}",
         "--capability=CAP_MKNOD,CAP_NET_ADMIN",
         "-E", f"ARTIFACT={genpack_json["name"]}"
@@ -859,8 +861,6 @@ def bash(variant):
     lower_exec(variant.lower_image, "bash")
 
 def copy_upper_files(upper_dir):
-    if not os.path.isdir(upper_dir):
-        raise FileNotFoundError(f"Upper directory {upper_dir} does not exist.")
     # copy mixin files
     for mixin_id in mixins:
         mixin_dir = os.path.join(mixin_root, mixin_id)
@@ -882,7 +882,15 @@ def upper(variant):
     if not os.path.isfile(variant.lower_image) or not os.path.exists(variant.lower_files):
         raise FileNotFoundError(f"Lower image {variant.lower_image} or lower files {variant.lower_files} does not exist. Please run 'genpack lower' first.")
 
-    subprocess.run(sudo(['mkdir', '-p', variant.upper_dir]), check=True)
+    # create upper image if it does not exist
+    if not os.path.isfile(variant.upper_image):
+        with open(variant.upper_image, "wb") as f:
+            f.seek(DEFAULT_UPPER_SIZE_IN_GIB * 1024 * 1024 * 1024 - 1)
+            f.write(b'\x00')
+
+        logging.info(f"Formatting filesystem on {variant.upper_image}")
+        subprocess.run(['mkfs.ext4', variant.upper_image], check=True)
+        logging.info("Filesystem formatted successfully.")
 
     # reset upper dir by deleting files not listed in lower_files
     logging.info("Deleting upper files not listed in lower files...")
@@ -898,168 +906,173 @@ def upper(variant):
                 files_to_preserve.add(dirname)
                 dirname = os.path.dirname(dirname)
 
-    files_to_remove = set()
-    find = subprocess.Popen(sudo(["find", variant.upper_dir, "-printf", "%P\\n"]), stdout=subprocess.PIPE, text=True, bufsize=1)
-    try:
-        for line in find.stdout:
-            line = line.rstrip('\n')
-            if line == "": continue
-            #else
-            files_to_remove.add(line)
-    finally:
-        find.wait()
-    
-    for file in files_to_preserve:
-        if file in files_to_remove:
-            files_to_remove.remove(file)
-
-    # safety check
-    for file in files_to_remove:
-        normalized = os.path.normpath(file)
-        if normalized.startswith("..") or normalized.startswith("/"):
-            raise ValueError(f"File to remove {file} is suspicious.")
+    with TempMount(variant.upper_image) as mount_point:
+        upper_dir = os.path.join(mount_point, "upper")
+        subprocess.run(sudo(["mkdir", "-p", upper_dir]), check=True)
+        files_to_remove = set()
+        find = subprocess.Popen(sudo(["find", upper_dir, "-printf", "%P\\n"]), stdout=subprocess.PIPE, text=True, bufsize=1)
+        try:
+            for line in find.stdout:
+                line = line.rstrip('\n')
+                if line == "": continue
+                #else
+                files_to_remove.add(line)
+        finally:
+            find.wait()
         
-    def chunk_generator(lst, n):
-        for i in range(0, len(lst), n):
-            yield lst[i : i + n]
+        for file in files_to_preserve:
+            if file in files_to_remove:
+                files_to_remove.remove(file)
 
-    for chunk in chunk_generator(list(files_to_remove), 64):
-        subprocess.run(sudo(["rm", "-rf"] + chunk), check=True, cwd=variant.upper_dir)
+        # safety check
+        for file in files_to_remove:
+            normalized = os.path.normpath(file)
+            if normalized.startswith("..") or normalized.startswith("/"):
+                raise ValueError(f"File to remove {file} is suspicious.")
+            
+        def chunk_generator(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i : i + n]
 
-    # copy-up from lower to upper
-    logging.info("Copying files from lower image to upper directory...")
-    with TempMount(variant.lower_image) as mount_point:
-        subprocess.run(sudo(["rsync", "-a", f"--files-from={variant.lower_files}", "--relative", mount_point + "/", variant.upper_dir]), check=True)
+        for chunk in chunk_generator(list(files_to_remove), 64):
+            subprocess.run(sudo(["rm", "-rf"] + chunk), check=True, cwd=upper_dir)
 
-    upper_exec(variant, ["exec-package-scripts-and-generate-metadata"])
+        # copy-up from lower to upper
+        logging.info("Copying files from lower image to upper directory...")
+        with TempMount(variant.lower_image) as mount_point:
+            subprocess.run(sudo(["rsync", "-a", f"--files-from={variant.lower_files}", "--relative", mount_point + "/", upper_dir]), check=True)
 
-    # merge genpack.json
-    merged_genpack_json = {}
-    for mixin_id in mixins:
-        mixin_genpack_json = mixin_genpack_json.get(mixin_id, {})
-        merge_genpack_json(merged_genpack_json, mixin_genpack_json, [f"mixin({mixin_id})", "genpack.json"], [
+        upper_exec(upper_dir, variant, ["exec-package-scripts-and-generate-metadata"])
+
+        # merge genpack.json
+        merged_genpack_json = {}
+        for mixin_id in mixins:
+            mixin_genpack_json = mixin_genpack_json.get(mixin_id, {})
+            merge_genpack_json(merged_genpack_json, mixin_genpack_json, [f"mixin({mixin_id})", "genpack.json"], [
+                "users","groups", "services", "arch"
+            ])
+        merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], [
             "users","groups", "services", "arch"
         ])
-    merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], [
-        "users","groups", "services", "arch"
-    ])
 
-    # create groups
-    groups = merged_genpack_json.get("groups", [])
-    for group in groups:
-        name = group if isinstance(group, str) else None
-        gid = None
-        if name is None:
-            if not isinstance(group, dict): raise Exception("group must be string or dict")
-            #else
-            if "name" not in group: raise Exception("group dict must have 'name' key")
-            #else
-            name = group["name"]
-            if "gid" in group: gid = group["gid"]
-        groupadd_cmd = ["groupadd"]
-        if gid is not None: groupadd_cmd += ["-g", str(gid)]
-        groupadd_cmd.append(name)
-        logging.info("Creating group %s..." % name)
-        upper_exec(variant, groupadd_cmd)
-
-    # create users
-    users = merged_genpack_json.get("users", [])
-    for user in users:
-        name = user if isinstance(user, str) else None
-        if name is None:
-            if not isinstance(user, dict): raise Exception("user must be string or dict")
-            #else
-            if "name" not in user: raise Exception("user dict must have 'name' key")
-            #else
-            name = user["name"]
-        uid = user.get("uid", None)
-        comment = user.get("comment", None)
-        home = user.get("home", None)
-        create_home = user.get("create_home", user.get("create-home", True))
-        shell = user.get("shell", None)
-        initial_group = user.get("initial_group", user.get("initial-group", None))
-        additional_groups = user.get("additional_groups", user.get("additional-groups", []))
-        if isinstance(additional_groups, str):
-            additional_groups = [additional_groups]
-        elif not isinstance(additional_groups, list):
-            raise Exception("additional-groups must be list or string")
-        if "shell" in user: shell = user["shell"]
-        empty_password = user.get("empty_password", user.get("empty-password", False))
-        useradd_cmd = ["useradd"]
-        if uid is not None: useradd_cmd += ["-u", str(uid)]
-        if comment is not None: useradd_cmd += ["-c", comment]
-        if home is not None: useradd_cmd += ["-d", home]
-        if initial_group is not None: useradd_cmd += ["-g", initial_group]
-        if len(additional_groups) > 0:
-            useradd_cmd += ["-G", ",".join(additional_groups)]
-        if shell is not None: useradd_cmd += ["-s", shell]
-        if create_home: useradd_cmd += ["-m"]
-        if empty_password: useradd_cmd += ["-p", ""]
-        useradd_cmd.append(name)
-        logging.info("Creating user %s..." % name)
-        upper_exec(variant, useradd_cmd)
-
-    copy_upper_files(variant.upper_dir)
-
-    # execute build sctript if exists
-    build_script = os.path.join(variant.upper_dir, "build")
-    if os.path.isfile(build_script):
-        logging.info(f"Executing build script: /build")
-        upper_exec(variant, ["/build"])
-    build_script_d = os.path.join(variant.upper_dir, "build.d")
-    if os.path.isdir(build_script_d):
-        # os.listdir returns filenames in arbitrary order, usually ASCII order on most filesystems,
-        # but it is not guaranteed by Python. If you want ASCII order, sort explicitly:
-        user_subdirs = []
-        def determine_interpreter(script):
-            if os.access(script_path, os.X_OK): return None
-            #else
-            if script.endswith(".sh"): return "/bin/sh"
-            #else
-            if script.endswith(".py"): return "/usr/bin/python"
-            raise ValueError(f"Script is not executable: {script}")
-
-        for script in sorted(os.listdir(build_script_d)):
-            script_path = os.path.join(build_script_d, script)
-            if os.path.isfile(script_path):
-                interpreter = determine_interpreter(script_path)
-                logging.info(f"Executing build script: /build.d/{script}")
-                script_to_run_in_container = os.path.join("/build.d", script)
-                upper_exec(variant, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container])
-            elif os.path.isdir(script_path):
-                user_subdirs.append(script)
-                logging.info(f"Found user subdirectory in build.d: {script_path}")
-        
-        for subdir in user_subdirs:
-            subdir_path = os.path.join(build_script_d, subdir)
-            for script in sorted(os.listdir(subdir_path)):
-                script_path = os.path.join(subdir_path, script)
-                if not os.path.isfile(script_path):
-                    logging.warning(f"Skipping non-file in /build.d/{subdir}: {script}")
-                    continue
+        # create groups
+        groups = merged_genpack_json.get("groups", [])
+        for group in groups:
+            name = group if isinstance(group, str) else None
+            gid = None
+            if name is None:
+                if not isinstance(group, dict): raise Exception("group must be string or dict")
                 #else
-                logging.info(f"Executing build script in user subdirectory: /build.d/{subdir}/{script} as user {subdir}")
-                interpreter = determine_interpreter(script_path)
-                script_to_run_in_container = os.path.join("/build.d", subdir, script)
-                upper_exec(variant, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container], user=subdir)
+                if "name" not in group: raise Exception("group dict must have 'name' key")
+                #else
+                name = group["name"]
+                if "gid" in group: gid = group["gid"]
+            groupadd_cmd = ["groupadd"]
+            if gid is not None: groupadd_cmd += ["-g", str(gid)]
+            groupadd_cmd.append(name)
+            logging.info("Creating group %s..." % name)
+            upper_exec(upper_dir, variant, groupadd_cmd)
 
-    # enable services
-    services = merged_genpack_json.get("services", [])
-    if len(services) > 0:
-        upper_exec(variant, ["systemctl", "enable"] + services)
+        # create users
+        users = merged_genpack_json.get("users", [])
+        for user in users:
+            name = user if isinstance(user, str) else None
+            if name is None:
+                if not isinstance(user, dict): raise Exception("user must be string or dict")
+                #else
+                if "name" not in user: raise Exception("user dict must have 'name' key")
+                #else
+                name = user["name"]
+            uid = user.get("uid", None)
+            comment = user.get("comment", None)
+            home = user.get("home", None)
+            create_home = user.get("create_home", user.get("create-home", True))
+            shell = user.get("shell", None)
+            initial_group = user.get("initial_group", user.get("initial-group", None))
+            additional_groups = user.get("additional_groups", user.get("additional-groups", []))
+            if isinstance(additional_groups, str):
+                additional_groups = [additional_groups]
+            elif not isinstance(additional_groups, list):
+                raise Exception("additional-groups must be list or string")
+            if "shell" in user: shell = user["shell"]
+            empty_password = user.get("empty_password", user.get("empty-password", False))
+            useradd_cmd = ["useradd"]
+            if uid is not None: useradd_cmd += ["-u", str(uid)]
+            if comment is not None: useradd_cmd += ["-c", comment]
+            if home is not None: useradd_cmd += ["-d", home]
+            if initial_group is not None: useradd_cmd += ["-g", initial_group]
+            if len(additional_groups) > 0:
+                useradd_cmd += ["-G", ",".join(additional_groups)]
+            if shell is not None: useradd_cmd += ["-s", shell]
+            if create_home: useradd_cmd += ["-m"]
+            if empty_password: useradd_cmd += ["-p", ""]
+            useradd_cmd.append(name)
+            logging.info("Creating user %s..." % name)
+            upper_exec(upper_dir, variant, useradd_cmd)
+
+        copy_upper_files(upper_dir)
+
+        # execute build script if exists
+        build_script = os.path.join(upper_dir, "build")
+        if os.path.isfile(build_script):
+            logging.info(f"Executing build script: /build")
+            upper_exec(upper_dir, variant, ["/build"])
+        build_script_d = os.path.join(upper_dir, "build.d")
+        if os.path.isdir(build_script_d):
+            # os.listdir returns filenames in arbitrary order, usually ASCII order on most filesystems,
+            # but it is not guaranteed by Python. If you want ASCII order, sort explicitly:
+            user_subdirs = []
+            def determine_interpreter(script):
+                if os.access(script_path, os.X_OK): return None
+                #else
+                if script.endswith(".sh"): return "/bin/sh"
+                #else
+                if script.endswith(".py"): return "/usr/bin/python"
+                raise ValueError(f"Script is not executable: {script}")
+
+            for script in sorted(os.listdir(build_script_d)):
+                script_path = os.path.join(build_script_d, script)
+                if os.path.isfile(script_path):
+                    interpreter = determine_interpreter(script_path)
+                    logging.info(f"Executing build script: /build.d/{script}")
+                    script_to_run_in_container = os.path.join("/build.d", script)
+                    upper_exec(upper_dir, variant, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container])
+                elif os.path.isdir(script_path):
+                    user_subdirs.append(script)
+                    logging.info(f"Found user subdirectory in build.d: {script_path}")
+            
+            for subdir in user_subdirs:
+                subdir_path = os.path.join(build_script_d, subdir)
+                for script in sorted(os.listdir(subdir_path)):
+                    script_path = os.path.join(subdir_path, script)
+                    if not os.path.isfile(script_path):
+                        logging.warning(f"Skipping non-file in /build.d/{subdir}: {script}")
+                        continue
+                    #else
+                    logging.info(f"Executing build script in user subdirectory: /build.d/{subdir}/{script} as user {subdir}")
+                    interpreter = determine_interpreter(script_path)
+                    script_to_run_in_container = os.path.join("/build.d", subdir, script)
+                    upper_exec(upper_dir, variant, [script_to_run_in_container] if interpreter is None else [interpreter, script_to_run_in_container], user=subdir)
+
+        # enable services
+        services = merged_genpack_json.get("services", [])
+        if len(services) > 0:
+            upper_exec(upper_dir, variant, ["systemctl", "enable"] + services)
 
 def upper_bash(variant):
-    if not os.path.isdir(variant.upper_dir):
-        raise FileNotFoundError(f"Upper directory {variant.upper_dir} does not exist. Please run 'upper' first")
-    copy_upper_files(variant.upper_dir)
-    logging.info("Running bash in the upper directory for debugging.")
-    upper_exec(variant, ["bash"])
+    if not os.path.isfile(variant.upper_image):
+        raise FileNotFoundError(f"Upper layer image {variant.upper_image} does not exist. Please run 'upper' first")
+    with TempMount(variant.upper_image) as mount_point:
+        upper_dir = os.path.join(mount_point, "upper")
+        copy_upper_files(upper_dir)
+        logging.info("Running bash in the upper directory for debugging.")
+        upper_exec(upper_dir, variant, ["bash"])
 
 def pack(variant, compression=None):
     if not os.path.isfile(variant.lower_files):
         raise FileNotFoundError(f"Lower files {variant.lower_files} does not exist. Please run 'lower' first.")
-    if not os.path.isdir(variant.upper_dir):
-        raise FileNotFoundError(f"Upper directory {variant.upper_dir} does not exist. Please run 'upper' first")
+    if not os.path.isfile(variant.upper_image):
+        raise FileNotFoundError(f"Upper layer image {variant.upper_image} does not exist. Please run 'upper' first.")
     #else
 
     merged_genpack_json = {}
@@ -1083,16 +1096,19 @@ def pack(variant, compression=None):
     else:
         raise ValueError(f"Unknown compression type: {compression}")
 
-    cmdline = ["mksquashfs", variant.upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
-    cmdline += compression_opts
-    cmdline += ["-e", "build", "build.d", "build.d/*", "var/log/*.log", "var/tmp/*"]
+    with TempMount(variant.upper_image) as mount_point:
+        upper_dir = os.path.join(mount_point, "upper")
+        cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
+        cmdline += compression_opts
+        cmdline += ["-e", "build", "build.d", "build.d/*", "var/log/*.log", "var/tmp/*"]
 
-    logging.info(f"Creating SquashFS image: {outfile} with compression {compression}")
-    if os.path.exists(outfile):
-        logging.info(f"Output file {outfile} already exists, removing it.")
-        os.remove(outfile)
-    
-    subprocess.run(sudo(cmdline), check=True)
+        logging.info(f"Creating SquashFS image: {outfile} with compression {compression}")
+        if os.path.exists(outfile):
+            logging.info(f"Output file {outfile} already exists, removing it.")
+            os.remove(outfile)
+        
+        subprocess.run(sudo(cmdline), check=True)
+
     subprocess.run(sudo(['chown', f"{os.getuid()}:{os.getgid()}", outfile]), check=True)
 
 def get_latest_mtime(*args):
