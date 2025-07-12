@@ -23,6 +23,7 @@ base_url = "http://ftp.iij.ad.jp/pub/linux/gentoo/"
 user_agent = "genpack/0.1"
 overlay_override = None
 independent_binpkgs = False
+deep_depclean = False
 genpack_json = None
 genpack_json_time = None
 
@@ -173,6 +174,13 @@ def replace_portage(lower_image, portage_tarball):
 def lower_exec(lower_image, cmdline, env=None):
     if isinstance(cmdline, str):
         cmdline = [cmdline]
+
+    if env is None:
+        env = {}
+
+    if os.environ.get("TERM", None) == "xterm-ghostty" and "TERM" not in env:
+        env["TERM"] = "xterm-256color"
+    
     # use PID for container name
     container_name = "genpack-%d" % os.getpid()
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
@@ -796,8 +804,13 @@ def lower(variant=None, devel=False):
     emerge_cmd += ["@preserved-rebuild"]
     lower_exec(variant.lower_image, emerge_cmd)
 
+    logging.info("Unmerging masked packages...")
+    lower_exec(variant.lower_image, ["unmerge-masked-packages"])
+
     logging.info("Cleaning up...")
-    cleanup_cmd = "emerge --depclean --with-bdeps=n"
+    cleanup_cmd = "emerge --depclean"
+    if deep_depclean:
+        cleanup_cmd += " --with-bdeps=n"
     cleanup_cmd += " && etc-update --automode -5"
     cleanup_cmd += " && eclean-dist -d"
     cleanup_cmd += " && eclean-pkg"
@@ -1122,6 +1135,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--overlay-override", default=None, help="Directory to override genpack-overlay")
     parser.add_argument("--independent-binpkgs", action="store_true", help="Use independent binpkgs, do not use shared one")
+    parser.add_argument("--deep-depclean", action="store_true", help="Perform deep depclean, removing all non-runtime packages"  )
     parser.add_argument("--compression", choices=["gzip", "xz", "lzo", "none"], default=None, help="Compression type for the final SquashFS image")
     parser.add_argument("--devel", action="store_true", help="Generate development image, if supported by genpack.json")
     parser.add_argument("--variant", default=None, help="Variant to use from genpack.json, if supported")
@@ -1162,6 +1176,8 @@ if __name__ == "__main__":
     overlay_override = args.overlay_override
 
     independent_binpkgs = args.independent_binpkgs or genpack_json.get("independent_binpkgs", False)
+    deep_depclean = args.deep_depclean
+
     variant = Variant(args.variant or genpack_json.get("default_variant", None))
     if variant.name is not None:
         available_variants = genpack_json.get("variants", {})
