@@ -797,7 +797,7 @@ def lower(variant=None, devel=False):
     lower_exec(variant.lower_image, emerge_cmd)
 
     logging.info("Cleaning up...")
-    cleanup_cmd = "emerge --depclean"
+    cleanup_cmd = "emerge --depclean --with-bdeps=n"
     cleanup_cmd += " && etc-update --automode -5"
     cleanup_cmd += " && eclean-dist -d"
     cleanup_cmd += " && eclean-pkg"
@@ -1095,6 +1095,28 @@ def get_latest_mtime(*args):
     logging.debug(f"Latest mtime from {args} is {latest}")
     return latest
 
+def create_archive():
+    logging.info("Creating archive of the current directory...")
+    name = genpack_json.get("name", os.path.basename(os.getcwd()))
+    archive_name = f"genpack-{name}.tar.gz"
+    if os.path.isfile(archive_name):
+        logging.info(f"Archive {archive_name} already exists, removing it.")
+        os.remove(archive_name)
+
+    targets = []
+    if os.path.isfile("genpack.json5"): targets.append("genpack.json5")
+    elif os.path.isfile("genpack.json"): targets.append("genpack.json")
+
+    if os.path.isdir("files"): targets.append("files")
+    if os.path.isdir("savedconfig"): targets.append("savedconfig")
+    if os.path.isdir("patches"): targets.append("patches")
+    if os.path.isdir("kernel"): targets.append("kernel")
+
+    subprocess.run(["tar", "zcvf", archive_name] + targets, check=True)
+
+    logging.info(f"Archive created: {archive_name}")
+    return archive_name
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genpack image Builder")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -1103,7 +1125,7 @@ if __name__ == "__main__":
     parser.add_argument("--compression", choices=["gzip", "xz", "lzo", "none"], default=None, help="Compression type for the final SquashFS image")
     parser.add_argument("--devel", action="store_true", help="Generate development image, if supported by genpack.json")
     parser.add_argument("--variant", default=None, help="Variant to use from genpack.json, if supported")
-    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "upper-clean", "pack"], nargs="?", default="build", help="Action to perform")
+    parser.add_argument("action", choices=["build", "lower", "bash", "upper", "upper-bash", "upper-clean", "pack", "archive"], nargs="?", default="build", help="Action to perform")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
@@ -1114,9 +1136,12 @@ if __name__ == "__main__":
 
     if not os.path.isfile(".gitignore"):
         with open(".gitignore", "w") as f:
-            f.write("work/\n")
-            f.write("*.squashfs\n")
-            f.write(".vscode/\n")
+            f.write("/work/\n")
+            f.write("/*.squashfs\n")
+            f.write("/*.img\n")
+            f.write("/*.iso\n")
+            f.write("/*.tar.gz\n")
+            f.write("/.vscode/\n")
         logging.info("Created .gitignore file with default settings.")
     
     if not os.path.isdir(".vscode"):
@@ -1129,7 +1154,11 @@ if __name__ == "__main__":
                 f.write('  "python.analysis.exclude": ["work/"]\n')
                 f.write('}\n')
             logging.info("Created .vscode/settings.json with default settings.")
-    
+
+    if args.action == "archive":
+        create_archive()
+        exit(0)
+
     overlay_override = args.overlay_override
 
     independent_binpkgs = args.independent_binpkgs or genpack_json.get("independent_binpkgs", False)
