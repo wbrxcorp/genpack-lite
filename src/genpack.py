@@ -223,7 +223,10 @@ def upper_exec(variant, cmdline, user=None):
         "-E", f"ARTIFACT={genpack_json["name"]}"
     ]
     if variant.name is not None:
-        nspawn_cmdline += [f"-E", f"VARIANT={variant.name}"]
+        nspawn_cmdline += ["-E", f"VARIANT={variant.name}"]
+
+    if os.environ.get("TERM", None) == "xterm-ghostty":
+        nspawn_cmdline += ["-E", "TERM=xterm-256color"]
 
     if user is not None:
         if not isinstance(user, str):
@@ -974,7 +977,7 @@ def upper(variant):
         home = user.get("home", None)
         create_home = user.get("create_home", user.get("create-home", True))
         shell = user.get("shell", None)
-        initial_group = user.get("initial_group", user.get("initial-group", "users"))
+        initial_group = user.get("initial_group", user.get("initial-group", None))
         additional_groups = user.get("additional_groups", user.get("additional-groups", []))
         if isinstance(additional_groups, str):
             additional_groups = [additional_groups]
