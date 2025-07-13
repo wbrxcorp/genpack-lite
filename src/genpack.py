@@ -28,6 +28,8 @@ deep_depclean = False
 genpack_json = None
 genpack_json_time = None
 
+container_name = "genpack-%d" % os.getpid()
+
 mixin_root = os.path.join(work_root, "mixins")
 mixins = []
 mixin_genpack_json = {}
@@ -183,7 +185,6 @@ def lower_exec(lower_image, cmdline, env=None):
         env["TERM"] = "xterm-256color"
     
     # use PID for container name
-    container_name = "genpack-%d" % os.getpid()
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
         "--as-pid2", "-M", container_name, f"--image={lower_image}",
         "--tmpfs=/var/tmp",
@@ -214,7 +215,6 @@ def escape_colon(s):
 def upper_exec(upper_dir, variant, cmdline, user=None):
     # convert command to list if it is string
     if isinstance(cmdline, str): cmdline = [cmdline]
-    container_name = "genpack-%d" % os.getpid()
     os.makedirs(download_dir, exist_ok=True)
 
     nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
@@ -737,6 +737,7 @@ def lower(variant=None, devel=False):
         "use": {
             "sys-libs/glibc": "audit", # Intentionally causing glibc to be rebuilt
             "sys-kernel/installkernel":"dracut", # genpack depends on dracut
+            "sys-fs/squashfs-tools":"lz4 lzma lzo xattr zstd", # genpack uses lz4, lzma, lzo and zstd compression for squashfs
             "app-crypt/libb2":"-openmp", # openmp support brings gcc dependency, which is not generally needed for genpack
             "dev-lang/perl":"minimal",
             "app-editors/vim":"minimal"
@@ -1069,6 +1070,8 @@ def upper_bash(variant):
         upper_exec(upper_dir, variant, ["bash"])
 
 def pack(variant, compression=None):
+    if not os.path.isfile(variant.lower_image):
+        raise FileNotFoundError(f"Lower image {variant.lower_image} does not exist. Please run 'lower' first.")
     if not os.path.isfile(variant.lower_files):
         raise FileNotFoundError(f"Lower files {variant.lower_files} does not exist. Please run 'lower' first.")
     if not os.path.isfile(variant.upper_image):
@@ -1098,7 +1101,7 @@ def pack(variant, compression=None):
 
     with TempMount(variant.upper_image) as mount_point:
         upper_dir = os.path.join(mount_point, "upper")
-        cmdline = ["mksquashfs", upper_dir, outfile, "-wildcards", "-noappend", "-no-exports"]
+        cmdline = ["mksquashfs", "/mnt/upper", os.path.join("/mnt/outdir",outfile), "-wildcards", "-noappend", "-no-exports"]
         cmdline += compression_opts
         cmdline += ["-e", "build", "build.d", "build.d/*", "var/log/*.log", "var/tmp/*"]
 
@@ -1106,10 +1109,14 @@ def pack(variant, compression=None):
         if os.path.exists(outfile):
             logging.info(f"Output file {outfile} already exists, removing it.")
             os.remove(outfile)
-        
-        subprocess.run(sudo(cmdline), check=True)
 
-    subprocess.run(sudo(['chown', f"{os.getuid()}:{os.getgid()}", outfile]), check=True)
+        nspawn_cmdline = ["systemd-nspawn", "-q", "--suppress-sync=true", 
+            "--as-pid2", "-M", container_name, f"--image={variant.lower_image}",
+            f"--bind={upper_dir}:/mnt/upper",
+            f"--bind=.:/mnt/outdir{':rootidmap' if os.geteuid() != 0 else ''}"
+        ]
+        nspawn_cmdline += cmdline
+        subprocess.run(sudo(nspawn_cmdline), check=True)
 
 def get_latest_mtime(*args):
     latest = 0.0
