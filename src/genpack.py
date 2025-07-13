@@ -7,7 +7,7 @@ import json5 # dev-python/json5
 import requests # dev-python/requests
 
 DEFAULT_LOWER_SIZE_IN_GIB = 24  # Default max size of lower image in GiB
-DEFAULT_UPPER_SIZE_IN_GIB = 8  # Default max size of upper image in GiB
+DEFAULT_UPPER_SIZE_IN_GIB = 12  # Default max size of upper image in GiB
 OVERLAY_SOURCE = "https://github.com/wbrxcorp/genpack-overlay.git"
 
 arch = os.uname().machine
