@@ -658,7 +658,7 @@ def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","dev
             if arch in k.split('|'):
                 merge_genpack_json(trunk, v, path + [f"arch={k}"], [
                     "packages","buildtime_packages","devel_packages",
-                    "accept_keywords","use","mask","license","binpkg_exclude","services"
+                    "accept_keywords","use","mask","license","binpkg_excludes","services"
                 ])
     
     if "variants" in allowed_properties and "variants" in branch and variant is not None:
@@ -669,7 +669,7 @@ def merge_genpack_json(trunk, branch, path, allowed_properties = ["outfile","dev
         if variant in branch["variants"]:
             merge_genpack_json(trunk, branch["variants"][variant], path + [f"variant={variant}"], [
                 "name","outfile","packages","buildtime_packages","devel_packages",
-                "accept_keywords","use","mask","license","binpkg_exclude","users","groups",
+                "accept_keywords","use","mask","license","binpkg_excludes","users","groups",
                 "services","arch"
             ])
 
@@ -769,12 +769,12 @@ def lower(variant=None, devel=False):
                                 merged_genpack_json.get("license", {}), 
                                 merged_genpack_json.get("mask", []))
 
-    # binpkg_exclude
-    binpkg_exclude = merged_genpack_json.get("binpkg_exclude", [])
-    if isinstance(binpkg_exclude, str):
-        binpkg_exclude = [binpkg_exclude]
-    elif not isinstance(binpkg_exclude, list):
-        raise ValueError("binpkg-exclude must be a string or a list of strings")
+    # binpkg_excludes
+    binpkg_excludes = merged_genpack_json.get("binpkg_excludes", [])
+    if isinstance(binpkg_excludes, str):
+        binpkg_exclude = [binpkg_excludes]
+    elif not isinstance(binpkg_excludes, list):
+        raise ValueError("binpkg-excludes must be a string or a list of strings")
 
     # circular dependency breaker
     if "circulardep-breaker" in genpack_json:
@@ -787,16 +787,16 @@ def lower(variant=None, devel=False):
             env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
             emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-u", "--keep-going"]
             if len(binpkg_exclude) > 0:
-                emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
-                emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+                emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_excludes)]
+                emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_excludes)]
             emerge_cmd += circulardep_breaker_packages
             lower_exec(variant.lower_image, emerge_cmd, env)
 
     logging.info("Emerging all packages...")
     emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-uDN", "--keep-going"]
-    if len(binpkg_exclude) > 0:
-        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
-        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+    if len(binpkg_excludes) > 0:
+        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_excludes)]
+        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_excludes)]
     emerge_cmd += ["@world", "genpack-progs", "@genpack-runtime", "@genpack-buildtime"]
     if devel:
         emerge_cmd += ["@genpack-devel"]
@@ -804,9 +804,9 @@ def lower(variant=None, devel=False):
 
     logging.info("Rebuilding preserved packages...")
     emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y"]
-    if len(binpkg_exclude) > 0:
-        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_exclude)]
-        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_exclude)]
+    if len(binpkg_excludes) > 0:
+        emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_excludes)]
+        emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_excludes)]
     emerge_cmd += ["@preserved-rebuild"]
     lower_exec(variant.lower_image, emerge_cmd)
 
