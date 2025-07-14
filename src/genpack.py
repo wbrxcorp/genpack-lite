@@ -953,8 +953,8 @@ def upper(variant):
                 "users","groups", "services", "arch"
             ])
         merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], [
-            "users","groups", "services", "arch"
-        ])
+            "users","groups", "services", "arch", "variants"
+        ], variant)
 
         # create groups
         groups = merged_genpack_json.get("groups", [])
@@ -1081,7 +1081,9 @@ def pack(variant, compression=None):
     merged_genpack_json = {}
     merge_genpack_json(merged_genpack_json, genpack_json, ["genpack.json"], ["outfile","variants"])
 
-    name = variant.name or genpack_json["name"]
+    name = genpack_json["name"]
+    if variant is not None and variant.name is not None:
+        name += f"-{variant.name}"
     outfile = merged_genpack_json.get("outfile", f"{name}-{arch}.squashfs")
 
     if compression is None:
