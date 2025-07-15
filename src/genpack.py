@@ -786,7 +786,7 @@ def lower(variant=None, devel=False):
             logging.info("Emerging circular dependency breaker packages...")
             env = {"USE": circulardep_breaker_use} if circulardep_breaker_use is not None else None
             emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y", "-u", "--keep-going"]
-            if len(binpkg_exclude) > 0:
+            if len(binpkg_excludes) > 0:
                 emerge_cmd += ["--usepkg-exclude", " ".join(binpkg_excludes)]
                 emerge_cmd += ["--buildpkg-exclude", " ".join(binpkg_excludes)]
             emerge_cmd += circulardep_breaker_packages
