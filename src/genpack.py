@@ -461,6 +461,44 @@ def apply_portage_sets_and_flags(lower_image, runtime_packages, buildtime_packag
         elif os.path.exists(kernel_dir):
             logging.info(f"Removing existing kernel directory {kernel_dir}")
             subprocess.run(sudo(['rm', '-rf', kernel_dir]), check=True)
+        
+        # apply local overlay
+        overlay_dir = os.path.join(mount_point, "var/db/repos/genpack-local-overlay")
+        repos_conf = os.path.join(etc_portage_dir, "repos.conf/genpack-local-overlay.conf")
+        if os.path.isdir("overlay"):
+            logging.info(f"Installing local overlay...")
+            subprocess.run(sudo(['rsync', '-rlptD', "--delete", "overlay/", overlay_dir]), check=True)
+            if not os.path.isfile(repos_conf):
+                subprocess.run(sudo(['mkdir', '-p', os.path.dirname(repos_conf)]), check=True)
+                tee = subprocess.Popen(sudo(['tee', repos_conf]), stdin=subprocess.PIPE, text=True)
+                try:
+                    tee.stdin.write("[genpack-local-overlay]\nlocation=/var/db/repos/genpack-local-overlay\n")
+                finally:
+                    tee.stdin.close()
+                    tee.wait()
+            layout_conf = os.path.join(overlay_dir, "metadata/layout.conf")
+            if not os.path.exists(layout_conf):
+                logging.info(f"Creating layout.conf for local overlay")
+                subprocess.run(sudo(['mkdir', '-p', os.path.dirname(layout_conf)]), check=True)
+                tee = subprocess.Popen(sudo(['tee', layout_conf]), stdin=subprocess.PIPE, text=True)
+                try:
+                    tee.stdin.write("masters = gentoo\n")
+                finally:
+                    tee.stdin.close()
+                    tee.wait()
+            repo_name = os.path.join(overlay_dir, "profiles/repo_name")
+            if not os.path.exists(repo_name):
+                logging.info(f"Creating repo_name for local overlay")
+                subprocess.run(sudo(['mkdir', '-p', os.path.dirname(repo_name)]), check=True)
+                tee = subprocess.Popen(sudo(['tee', repo_name]), stdin=subprocess.PIPE, text=True)
+                try:
+                    tee.stdin.write("genpack-local-overlay\n")
+                finally:
+                    tee.stdin.close()
+                    tee.wait()
+        elif os.path.exists(overlay_dir):
+            logging.info(f"Removing existing local overlay directory {overlay_dir}")
+            subprocess.run(sudo(['rm', '-rf', overlay_dir, repos_conf]), check=True)
 
 def set_gentoo_profile(lower_image, profile_name):
     with TempMount(lower_image) as mount_point:
@@ -1152,6 +1190,7 @@ def create_archive():
     if os.path.isdir("savedconfig"): targets.append("savedconfig")
     if os.path.isdir("patches"): targets.append("patches")
     if os.path.isdir("kernel"): targets.append("kernel")
+    if os.path.isdir("overlay"): targets.append("overlay")
 
     subprocess.run(["tar", "zcvf", archive_name] + targets, check=True)
 
@@ -1226,7 +1265,7 @@ if __name__ == "__main__":
 
     if args.action in ["build", "lower"]:
         if os.path.exists(variant.lower_files):
-            latest_mtime = get_latest_mtime(genpack_json_time, "savedconfig", "patches", "kernel", mixin_root)
+            latest_mtime = get_latest_mtime(genpack_json_time, "savedconfig", "patches", "kernel", "overlay", mixin_root)
             if os.path.getmtime(variant.lower_files) < latest_mtime:
                 logging.info(f"Lower files {variant.lower_files} is outdated, rebuilding lower layer.")
                 os.remove(variant.lower_files)
