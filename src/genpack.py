@@ -839,6 +839,8 @@ def lower(variant=None, devel=False):
     if devel:
         emerge_cmd += ["@genpack-devel"]
     lower_exec(variant.lower_image, emerge_cmd)
+    logging.info("Rebuilding kernel modules if necessary...")
+    lower_exec(variant.lower_image, ["rebuild-kernel-modules-if-necessary"])
 
     logging.info("Rebuilding preserved packages...")
     emerge_cmd = ["emerge", "-bk", "--binpkg-respect-use=y"]
