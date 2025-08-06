@@ -260,6 +260,7 @@ std::string escape_colon(const std::filesystem::path& path) {
 
 struct NspawnOptions {
     std::map<std::string, std::string> env_vars;
+    std::optional<std::string> console;
     std::optional<std::filesystem::path> genpack_overlay_dir;
     std::optional<std::filesystem::path> binpkgs_dir;
     std::optional<std::filesystem::path> download_dir;
@@ -301,6 +302,9 @@ int nspawn(const std::filesystem::path& lower_img,
     }
     for (const auto& [key, value] : options.env_vars) {
         nspawn_cmdline.push_back("--setenv=" + key + "=" + value);
+    }
+    if (options.console) {
+        nspawn_cmdline.push_back("--console=" + *options.console);
     }
 
     TempDir overlay_image_dir;
@@ -482,6 +486,9 @@ int main(int argc, const char* argv[])
                     .default_value<std::vector<std::string>>({})
                     .append()
                     .help("Set an environment variable for the command in the lower image.");
+                argparser.add_argument("--console", "Console mode")
+                    .nargs(1)
+                    .help("Console mode(see man systemd-nspawn)");
                 argparser.add_argument("--binpkgs-dir", "-B", "Directory for binary packages.")
                     .nargs(1)
                     .help("Directory for binary packages in the lower image.");
@@ -530,6 +537,7 @@ int main(int argc, const char* argv[])
                 }
                 return ::nspawn(lower_img, cmdline, {
                     .env_vars = env_map,
+                    .console = argparser.present<std::string>("--console"),
                     .genpack_overlay_dir = argparser.present<std::string>("--genpack-overlay-dir"),
                     .binpkgs_dir = argparser.present<std::string>("--binpkgs-dir"),
                     .download_dir = argparser.present<std::string>("--download-dir"),
