@@ -16,7 +16,6 @@
 #include <argparse/argparse.hpp>
 
 bool debug = false;
-uid_t original_uid = getuid();
 
 bool is_mounted(const std::filesystem::path& path)
 {
@@ -36,6 +35,7 @@ bool is_mounted(const std::filesystem::path& path)
 
 void must_be_owned_by_original_user(const std::filesystem::path& path) 
 {
+    uid_t original_uid = getuid();
     if (original_uid == 0) {
         // If running as root, we can skip the ownership check
         return;
@@ -65,6 +65,7 @@ void must_be_accessible_by_original_user(const std::filesystem::path& path)
 
     auto mode = file_stat.st_mode;
 
+    uid_t original_uid = getuid();
     if (original_uid == 0) original_uid = file_stat.st_uid; // If running as root, use the file's owner UID
     if (file_stat.st_uid == original_uid && (mode & S_IWUSR)) {
         return; // File is writable by the original user
@@ -118,10 +119,6 @@ void mount_loop(const std::filesystem::path& source,
   const std::filesystem::path& mountpoint,
   const std::string& fstype = "auto")
 {
-    if (debug) {
-        std::cout << "original user ID: " << original_uid << std::endl;
-        std::cout << "Effective user ID: " << geteuid() << std::endl;
-    }
     must_be_accessible_by_original_user(source);
 
     RealRootSection root_section; // real uid must be root to mount
@@ -282,6 +279,7 @@ int nspawn(const std::filesystem::path& lower_img,
         "--tmpfs=/var/tmp",
         "--capability=CAP_MKNOD,CAP_SYS_ADMIN,CAP_NET_ADMIN", // Portage's network sandbox needs CAP_NET_ADMIN
     };
+    uid_t original_uid = getuid();
     // Bind mount the current directory to /mnt/host
     nspawn_cmdline.push_back(original_uid == 0 ? "--bind=.:/mnt/host" : "--bind=.:/mnt/host:rootidmap");
     if (options.binpkgs_dir) {
@@ -332,7 +330,83 @@ int copy(const std::filesystem::path& src_img, const std::filesystem::path& dst_
     TempDir dst_temp_dir;
     mount_loop(dst_img, dst_temp_dir.path(), "ext4");
 
-    return fork_and_exec({"rsync", "-a", "--files-from=-", "--relative", src_temp_dir.path().string() + "/", (dst_temp_dir.path() / dst_dir).string()});
+    //  - Read file list from stdin
+    //  - remove all files and links in dst except listed
+    //  - remove all empty directories in dst except listed
+    // create temporary file to hold the list of files to copy
+    char temp_file_template[] = "/tmp/genpack-helper.XXXXXX";
+    auto fd = mkstemp(temp_file_template);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to create temporary file for file list");
+    }
+
+    std::string line;
+    std::set<std::filesystem::path> files_to_copy;
+    while (std::getline(std::cin, line)) {
+        if (line.empty() || line[0] == '#') continue; // Skip empty lines and comments
+        std::string file_str_with_eol = line + "\n";
+        if (debug) std::cout << "Processing file: " << line << std::endl;
+        if (write(fd, file_str_with_eol.c_str(), file_str_with_eol.length()) < 0) {
+            close(fd);
+            throw std::runtime_error("Failed to write to temporary file for file list");
+        }
+
+        auto path = std::filesystem::path(line);
+        std::filesystem::path current;
+        for (const auto& part : path) {
+            current /= part;
+            if (part == ".." || part == ".") {
+                std::cerr << "Invalid path in file list: " << path.string() << std::endl;
+                continue; // Skip invalid paths
+            }
+            //else
+            files_to_copy.insert(current);
+        }
+    }
+    close(fd);
+
+    std::set<std::filesystem::path> files_to_remove;
+    std::set<std::filesystem::path> dirs_to_remove;
+    auto dst_actual_dir = dst_temp_dir.path() / dst_dir;
+    std::filesystem::create_directories(dst_actual_dir); // Ensure the destination directory exists
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(dst_actual_dir)) {
+        if (files_to_copy.find(std::filesystem::relative(entry.path(), dst_actual_dir)) == files_to_copy.end()) {
+            if (entry.is_regular_file() || entry.is_symlink()) {
+                files_to_remove.insert(entry.path());
+            } else if (entry.is_directory()) {
+                dirs_to_remove.insert(entry.path());
+            }
+        }
+    }
+
+    for (const auto& file : files_to_remove) {
+        if (std::filesystem::remove(file)) {
+            if (debug) std::cout << "Removed file: " << file << std::endl;
+        } else {
+            std::cerr << "Failed to remove file: " << file << std::endl;
+        }
+    }
+
+    std::vector<std::filesystem::path> dirs_to_remove_sorted(dirs_to_remove.begin(), dirs_to_remove.end());
+    std::sort(dirs_to_remove_sorted.begin(), dirs_to_remove_sorted.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+        return a.string().length() > b.string().length();
+    });
+
+    for (const auto& dir : dirs_to_remove_sorted) {
+        if (std::filesystem::is_empty(dir)) {
+            if (std::filesystem::remove(dir)) {
+                if (debug) std::cout << "Removed empty directory: " << dir << std::endl;
+            } else {
+                std::cerr << "Failed to remove directory: " << dir << std::endl;
+            }
+        } else {
+            if (debug) std::cerr << "Directory not empty, skipping removal: " << dir << std::endl;
+        }
+    }
+
+    auto rst = fork_and_exec({"rsync", debug? "-av" : "-a", "--files-from=" + std::string(temp_file_template), "--relative", src_temp_dir.path().string() + "/", (dst_temp_dir.path() / dst_dir).string()});
+    std::filesystem::remove(temp_file_template); // Clean up the temporary file
+    return rst;
 }
 
 int main(int argc, const char* argv[])
